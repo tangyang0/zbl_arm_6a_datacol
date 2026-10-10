@@ -120,39 +120,72 @@ class MasterBridge(Node):
             f"rate={args.rate}Hz vmax={args.vmax}rad/s engage={args.engage}")
 
     # ---------- 主臂重力补偿(经rosbridge调用主臂PC的controller_manager) ----------
+    def _master_list_controllers(self, ws):
+        ws.send(json.dumps({
+            "op": "call_service", "id": "lst",
+            "service": "/controller_manager/list_controllers", "args": {}}))
+        t0 = time.time()
+        while time.time() - t0 < 5.0:
+            m = json.loads(ws.recv())
+            if m.get("id") == "lst":
+                return (m.get("values") or {}).get("controller", [])
+        return []
+
+    def _master_switch(self, ws, activate, deactivate, strictness=1):
+        """返回ok(bool)或None(无响应)"""
+        ws.send(json.dumps({
+            "op": "call_service", "id": "sw",
+            "service": "/controller_manager/switch_controller",
+            "args": {
+                "activate_controllers": activate,
+                "deactivate_controllers": deactivate,
+                "strictness": strictness,
+                "activate_asap": False,
+                "timeout": {"sec": 3, "nanosec": 0},
+            }}))
+        t0 = time.time()
+        while time.time() - t0 < 5.0:
+            m = json.loads(ws.recv())
+            if m.get("id") == "sw":
+                return (m.get("values") or {}).get("ok", False)
+        return None
+
     def enable_master_gravity(self):
-        """激活主臂侧的零重力补偿控制器({side}_gravity_compensate_controller),
-        否则操作者需徒手对抗主臂自重。激活后保持, 退出时不去激活(避免臂突然变沉)。"""
+        """启动时强制主臂进入重力补偿模式:
+        显式去激活关节/笛卡尔控制器(即"保持使能锁死"状态), 激活重力补偿,
+        回查确认; 失败则FORCE_AUTO(4)自动踢掉占用接口的控制器再试一次。
+        激活后保持, 退出时不去激活(避免臂突然变沉)。"""
         import websocket as _ws
+        gc = f"{self.args.side}_gravity_compensate_controller"
+        others = [f"master_{self.args.side}_arm_joint_controller",
+                  f"master_{self.args.side}_arm_cartesian_controller"]
         try:
             ws = _ws.create_connection(self.args.master, timeout=5)
-            ws.send(json.dumps({
-                "op": "call_service", "id": "grav",
-                "service": "/controller_manager/switch_controller",
-                "args": {
-                    "activate_controllers":
-                        [f"{self.args.side}_gravity_compensate_controller"],
-                    "deactivate_controllers": [],
-                    "strictness": 1,       # BEST_EFFORT
-                    "activate_asap": False,
-                    "timeout": {"sec": 3, "nanosec": 0},
-                }}))
-            t0 = time.time()
-            while time.time() - t0 < 6.0:
-                m = json.loads(ws.recv())
-                if m.get("id") == "grav":
-                    ok = (m.get("values") or {}).get("ok", False)
-                    msg = (m.get("values") or {}).get("message", "")
-                    if ok:
-                        self.log(
-                            f"主臂重力补偿已激活"
-                            f"({self.args.side}_gravity_compensate_controller)")
-                    else:
-                        self.log_error(f"主臂重力补偿激活失败: {msg}")
-                    ws.close()
-                    return ok
-            self.log_error("主臂重力补偿激活无响应(链路抖动?)")
+            before = {c.get("name"): c.get("state")
+                      for c in self._master_list_controllers(ws)}
+            stuck = [n for n in others if before.get(n) == "active"]
+            if stuck:
+                self.log(
+                    f"检测到主臂位置伺服锁定: {stuck}, "
+                    f"强制切换至重力补偿模式...")
+            self._master_switch(ws, activate=[gc], deactivate=others,
+                                strictness=1)
+            states = {c.get("name"): c.get("state")
+                      for c in self._master_list_controllers(ws)}
+            if states.get(gc) != "active":
+                # 二次强推: FORCE_AUTO自动解除一切占用关节接口的控制器
+                self._master_switch(ws, activate=[gc], deactivate=[],
+                                    strictness=4)
+                states = {c.get("name"): c.get("state")
+                          for c in self._master_list_controllers(ws)}
             ws.close()
+            if states.get(gc) == "active":
+                self.log(f"主臂已进入重力补偿模式({gc})")
+                if stuck:
+                    self.log(f"已解除位置伺服锁定: {stuck}")
+                return True
+            self.log_error(
+                f"主臂重力补偿模式切换失败, 当前状态: {states.get(gc)}")
             return False
         except Exception as e:
             self.log_error(f"主臂重力补偿激活异常: {e}")
