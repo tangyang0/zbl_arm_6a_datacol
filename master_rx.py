@@ -11,6 +11,7 @@
     python3 master_rx.py --side right --port 9870
 """
 import argparse
+import datetime
 import json
 import math
 import socket
@@ -20,12 +21,19 @@ import websockets
 from websockets.sync.client import connect as ws_connect
 
 
+def log_line(msg):
+    now = datetime.datetime.now()
+    print(f"[{now.strftime('%m-%d %H:%M:%S.%f')[:-3]}] [master_rx] {msg}",
+          flush=True)
+    print(flush=True)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--side', choices=['left', 'right'], default='right')
     p.add_argument('--master', default='ws://192.168.31.7:9090')
-    p.add_argument('--throttle-ms', type=int, default=10,
-                   help='rosbridge服务端节流间隔ms(10=100Hz)')
+    p.add_argument('--throttle-ms', type=int, default=5,
+                   help='rosbridge服务端节流间隔ms(5=200Hz)')
     p.add_argument('--port', type=int, default=9870)
     args = p.parse_args()
 
@@ -48,8 +56,8 @@ def main():
                 ws.send(json.dumps(
                     {"op": "subscribe",
                      "topic": f"/{args.side}_joystick/input"}))
-                print(f"[master_rx] 已连接 {args.master}, "
-                      f"转发到 udp/{dest[0]}:{dest[1]}", flush=True)
+                log_line(f"已连接 {args.master}, "
+                         f"转发到 udp/{dest[0]}:{dest[1]}")
                 while True:
                     raw = ws.recv(timeout=5.0)
                     if isinstance(raw, bytes):
@@ -79,9 +87,9 @@ def main():
                     elif "_joystick/input" in t:
                         sock.sendto(("JOY " + json.dumps(m)).encode(), dest)
         except websockets.exceptions.TimeoutError:
-            print("[master_rx] 5秒无数据(链路或服务端异常)", flush=True)
+            log_line("5秒无数据(链路或服务端异常)")
         except Exception as e:
-            print(f"[master_rx] 连接断开({e}), 3秒后重连", flush=True)
+            log_line(f"连接断开({e}), 3秒后重连")
             time.sleep(3.0)
 
 
