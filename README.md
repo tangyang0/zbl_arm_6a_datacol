@@ -21,15 +21,49 @@ ros2 launch zbl_arm_6a_description test_single_arm.launch.py can_interface:=can4
 ```
 主臂PC开机即可,无需在其WebUI上做任何操作(它常驻发布关节流)。
 
+### 1.1 停止/重启 SDK 进程(机械臂断电重上电后, 不用重启容器)
+
+在当初运行 `&` 的那个终端里:
+```bash
+jobs                 # 看到 [1]+ Running ros2 launch ...
+kill -INT %1         # 等价于前台Ctrl+C, 优雅关闭全部节点(controller_manager/相机等)
+```
+
+那个终端已关闭(后台任务变孤儿进程)时:
+```bash
+pgrep -af "ros2 launch"                    # 找到PID
+kill -INT <PID>
+# 或一条命令:
+pkill -INT -f "ros2 launch.*zbl_arm_6a"
+```
+
+确认清理干净后重新 launch:
+```bash
+pgrep -af "x2robot|usb_cam|controller_manager"   # 应无残留进程
+ros2 launch zbl_arm_6a_description test_single_arm.launch.py can_interface:=can4 &
+```
+
+注意:
+- **不要用 `kill -9`**: launch 进程没机会清理子节点, 会留下孤儿进程,
+  此时再 launch 就是SDK README警告的"同一臂多套控制服务", 臂会异常抖动。
+  不慎发生时补刀: `pkill -9 -f x2robot_control_node; pkill -9 -f usb_cam`
+- 机械臂断电重上电不影响容器和宿主机 can4 接口(PCAN由USB供电),
+  清干净进程后直接重新 launch 即可, 无需动容器。
+
 ## 2. 干跑验证(不动从臂, 安全)
 
 容器内:
 ```bash
-source /opt/xr/core/install/setup.bash
-export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:/usr/local/lib
 cd /home/xr/workspace/zbl_arm_6a_teleop
 python3 master_bridge.py              # 右主臂(默认); 左臂加 --side left
 ```
+
+> 环境说明: 容器 `~/.bashrc` 末尾已自动执行
+> `source /opt/ros/jazzy/setup.bash`、`source /opt/xr/core/install/setup.bash`、
+> `export LD_LIBRARY_PATH=...:/usr/local/lib`、`export ROS_DOMAIN_ID=134`,
+> 所以**交互式终端**(docker exec -it ... bash)不需要手动 source。
+> 只有绕过 bash 非交互执行时才需要, 例如:
+> `docker exec zbl_arm_6a_sdk bash -c 'source /opt/xr/core/install/setup.bash && python3 ...'`
 手持主臂缓慢运动, 确认打印的关节角跟随、数值在从臂限位内:
 J1 ±2.792, J2 0~3.44, J3 -3.14~0, J4 ±1.57, J5 ±1.4, J6 ±1.745 (rad)
 Ctrl+C 退出。
