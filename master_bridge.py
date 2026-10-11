@@ -22,28 +22,56 @@ import datetime
 import json
 import math
 import os
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, CompressedImage
+from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Float64MultiArray
 from controller_manager_msgs.srv import SwitchController
+
+from lerobot_writer import EpisodeBuffer, write_episode
 
 # 从臂关节限位(来源: examples/python/joint_control.py, rad)
 SLAVE_LOWER = [-2.792, 0.0, -3.14, -1.57, -1.4, -1.745]
 SLAVE_UPPER = [2.792, 3.44, 0.0, 1.57, 1.4, 1.745]
 
+# 数采录制话题: 观测(joint_states含夹爪反馈/end_pose/图像) + 动作(两路指令)
+REC_TOPICS = [
+    "/joint_states",
+    "/joint_position_controller/commands",
+    "/gripper_controller/commands",
+    "/arm/end_pose",
+    "/eye_in_hand/eye_in_hand/image_raw/image_compressed",
+]
+
+
+# 日志级别配色(ANSI): 数采各状态一眼可辨
+_LEVEL_COLOR = {
+    "ERROR": "\033[1;91m",    # 亮红
+    "REC▶": "\033[1;92m",     # 亮绿: episode开始
+    "REC…": "\033[1;93m",     # 亮黄: 正在写入
+    "REC✓": "\033[1;96m",     # 亮青: 写入完成
+    "REC✗": "\033[1;41;97m",  # 红底白字: 丢弃/异常
+}
+
 
 def log_line(msg, level="INFO"):
-    """统一日志: 人类可读时间戳 + 空行分隔"""
+    """统一日志: 人类可读时间戳 + 空行分隔; REC/ERROR级别着色并加前置空行"""
     now = datetime.datetime.now()
-    print(f"[{now.strftime('%m-%d %H:%M:%S.%f')[:-3]}] [{level}] {msg}",
-          flush=True)
+    c = _LEVEL_COLOR.get(level, "")
+    head = f"[{now.strftime('%m-%d %H:%M:%S.%f')[:-3]}] [{level}] "
+    if c:
+        print(f"\n{c}{head}{msg}\033[0m", flush=True)
+    else:
+        print(f"{head}{msg}", flush=True)
     print(flush=True)
 
 
@@ -70,6 +98,13 @@ class MasterBridge(Node):
             Float64MultiArray, '/joint_position_controller/commands', 10)
         self.slave_joint_sub = self.create_subscription(
             JointState, '/joint_states', self.on_slave_joint_state, 10)
+        # 数采直接写LeRobot所需的额外观测流
+        self.endpose_sub = self.create_subscription(
+            PoseStamped, '/arm/end_pose', self.on_end_pose, 10)
+        self.image_sub = self.create_subscription(
+            CompressedImage,
+            '/eye_in_hand/eye_in_hand/image_raw/image_compressed',
+            self.on_image, 10)
 
         self.switch_cli = self.create_client(
             SwitchController, '/controller_manager/switch_controller')
@@ -113,6 +148,19 @@ class MasterBridge(Node):
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.bind(("127.0.0.1", args.port))
         self.udp.setblocking(False)
+
+        # 数采: 主臂手柄sw1短按 开/停一个episode
+        # 默认lerobot格式直接落盘; --rec-format bag 保留原始bag路线
+        self.task_dir = self.sanitize_task(args.task)   # 任务目录名
+        self.rec_buf = None        # lerobot格式的episode缓冲
+        self.rec_proc = None
+        self._rec_write_lock = threading.Lock()   # LeRobot写入串行化
+        self.rec_dir = None          # 当前episode目录
+        self.rec_t0 = None
+        self.rec_ep = 0
+        self._sw1_prev = False
+        self._last_sw1_ts = 0.0
+        self._scan_episodes()
 
         self.timer = self.create_timer(1.0 / args.rate, self.tick)
         self.log(
@@ -276,6 +324,15 @@ class MasterBridge(Node):
             return
         v = float(v)                  # 保留原始值用于标定
         self.trig_value = v
+        # sw1上升沿(短按)切换数采录制开/停
+        if not self.args.no_rec:
+            sw1 = bool(m.get("sw1", False))
+            now_pc = time.perf_counter()
+            if sw1 and not self._sw1_prev and \
+                    now_pc - self._last_sw1_ts > 0.5:
+                self._last_sw1_ts = now_pc
+                self.rec_toggle()
+            self._sw1_prev = sw1
         # 运行期观测范围(供--calib-trigger使用)
         if self._trig_obs_min is None or v < self._trig_obs_min:
             self._trig_obs_min = v
@@ -328,6 +385,25 @@ class MasterBridge(Node):
         grip = self.pick_joints(msg, ["arm_gripper"])
         if grip is not None:
             self.slave_gripper = grip[0]
+        # 数采: 观测流(6关节+夹爪)
+        if self.rec_buf is not None and pos is not None \
+                and self.slave_gripper is not None:
+            self.rec_buf.state.append(list(pos) + [self.slave_gripper])
+            self.rec_buf.state_ts.append(time.perf_counter())
+
+    def on_end_pose(self, msg):
+        if self.rec_buf is None:
+            return
+        p, q = msg.pose.position, msg.pose.orientation
+        self.rec_buf.pose.append(
+            [p.x, p.y, p.z, q.x, q.y, q.z, q.w])
+        self.rec_buf.pose_ts.append(time.perf_counter())
+
+    def on_image(self, msg):
+        if self.rec_buf is None:
+            return
+        self.rec_buf.imgs.append(bytes(msg.data))
+        self.rec_buf.img_ts.append(time.perf_counter())
 
     def gripper_str(self):
         if self.slave_gripper is None:
@@ -397,6 +473,9 @@ class MasterBridge(Node):
         msg.data = q
         self.joint_cmd_pub.publish(msg)
         self.last_cmd = q
+        if self.rec_buf is not None:
+            self.rec_buf.aj.append(list(q))
+            self.rec_buf.aj_ts.append(time.perf_counter())
 
     def wait_master(self, timeout=10.0):
         self.log("等待主臂数据流...")
@@ -452,7 +531,7 @@ class MasterBridge(Node):
         self.log(
             f"[延迟诊断] 主臂帧到达间隔: {fmt(self._stat_rx_gap)} | "
             f"发布时帧龄: {fmt(self._stat_age)} | "
-            f"tick周期: {fmt(self._stat_tick)} | "
+            f"tick周期: {fmt(self._stat_tick)} | {self.rec_str()} | "
             f"{self.gripper_str()} | {self.trigger_str()} | "
             f"手柄帧:{self.joy_count}"
             + (f" 兜底扳机帧:{self.trigger_count}"
@@ -479,6 +558,135 @@ class MasterBridge(Node):
         msg.data = [cmd]
         self.gripper_cmd_pub.publish(msg)
         self.grip_last_cmd = cmd
+        if self.rec_buf is not None:
+            self.rec_buf.ag.append([cmd])
+            self.rec_buf.ag_ts.append(time.perf_counter())
+
+    # ---------- 数采录制(sw1短按开/停episode) ----------
+    @staticmethod
+    def sanitize_task(text):
+        """自然语言任务文本 -> 目录名(中文/字母数字保留, 其余转下划线)"""
+        out = ''.join(
+            c if (c.isalnum() or c in '-_') else '_' for c in text.strip())
+        return out[:60] or 'demo'
+
+    def _scan_episodes(self):
+        if self.args.rec_format == "bag":
+            base = os.path.join(self.args.rec_dir, self.task_dir)
+            try:
+                os.makedirs(base, exist_ok=True)
+                eps = [d for d in os.listdir(base)
+                       if d.startswith("episode_")]
+                self.rec_ep = len(eps)
+            except Exception:
+                self.rec_ep = 0
+        else:   # lerobot: episode计数来自已有数据集
+            info = os.path.join(
+                self.args.data_root, self.args.dataset, "meta", "info.json")
+            try:
+                with open(info) as f:
+                    self.rec_ep = json.load(f)["total_episodes"]
+            except Exception:
+                self.rec_ep = 0
+
+    def _recording(self):
+        return self.rec_proc is not None or self.rec_buf is not None
+
+    def rec_toggle(self):
+        if self._recording():
+            self.rec_stop()
+            return
+        self.rec_ep += 1
+        if self.args.rec_format == "bag":
+            ep_dir = os.path.join(
+                self.args.rec_dir, self.task_dir,
+                f"episode_{self.rec_ep:04d}")
+            self.rec_dir = ep_dir
+            self.rec_t0 = time.time()
+            self.rec_proc = subprocess.Popen(
+                ["ros2", "bag", "record", "-o", ep_dir, "--topics"]
+                + REC_TOPICS,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # rosbag2要求输出目录不存在(由它创建), 等目录建好后再写任务标签
+            for _ in range(20):
+                if os.path.isdir(ep_dir):
+                    break
+                time.sleep(0.1)
+            try:
+                with open(os.path.join(ep_dir, "instruction.txt"), "w",
+                          encoding="utf-8") as f:
+                    f.write(self.args.task.strip() + "\n")
+            except OSError as e:
+                self.log_error(f"写入instruction.txt失败: {e}")
+            self.log(f"▶▶▶ episode_{self.rec_ep:04d} 开始录制 -> {ep_dir} "
+                     f"任务: {self.args.task}", "REC▶")
+        else:   # lerobot: 直接在内存累积原始流, 停止时写数据集
+            self.rec_buf = EpisodeBuffer()
+            self.rec_dir = os.path.join(
+                self.args.data_root, self.args.dataset)
+            self.rec_t0 = time.time()
+            self.log(f"▶▶▶ episode_{self.rec_ep:04d} 开始录制 -> LeRobot数据集 "
+                     f"{self.rec_dir} 任务: {self.args.task}", "REC▶")
+
+    def rec_stop(self, sync=False):
+        if self.rec_proc is not None:      # bag路径
+            self.rec_proc.send_signal(signal.SIGINT)
+            try:
+                self.rec_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.rec_proc.kill()
+            self.log(f"■ episode_{self.rec_ep:04d} 结束, "
+                     f"时长{time.time() - self.rec_t0:.1f}s, 数据在容器内 "
+                     f"{self.rec_dir}", "REC…")
+            self.rec_proc = None
+            return
+        if self.rec_buf is None:           # lerobot路径
+            return
+        buf, ep = self.rec_buf, self.rec_ep
+        dur = time.time() - self.rec_t0
+        self.rec_buf = None
+        # 过短的录制(测试性按压)掐头去尾后必然不足10帧, 直接丢弃不写
+        if dur < self.args.trim * 2 + 0.6:
+            self.log(f"✗ episode_{ep:04d} 时长{dur:.1f}s过短, 已丢弃"
+                     f"(需>{self.args.trim * 2 + 0.6:.1f}s才成集)", "REC✗")
+            return
+        self.log(f"■ episode_{ep:04d} 录制结束({dur:.1f}s), "
+                 f"正在写入LeRobot...", "REC…")
+
+        def _write():
+            # 写入串行化: 上一集还在编码时, 本集排队等待, 避免并发写坏数据集
+            with self._rec_write_lock:
+                try:
+                    n = write_episode(
+                        buf, self.rec_dir, self.args.dataset,
+                        self.args.task.strip(),
+                        action_mode=self.args.action_mode,
+                        fps=self.args.fps, trim=self.args.trim,
+                        grip_max=self.args.gripper_max)
+                    self.log(f"✓✓✓ episode_{ep:04d} 已写入: {n}帧 -> "
+                             f"{self.rec_dir}", "REC✓")
+                except Exception as e:
+                    self.log(
+                        f"✗✗✗ episode_{ep:04d} LeRobot写入失败: {e}",
+                        "REC✗")
+
+        if sync:
+            _write()
+        else:   # 后台写入, 不阻塞遥操控制循环(视频编码需数秒)
+            threading.Thread(target=_write, daemon=True).start()
+
+    def wait_rec_writes(self, timeout=180.0):
+        """等待在途的后台LeRobot写入完成(退出前必须调用, 否则编码被杀数据丢失)"""
+        if self._rec_write_lock.acquire(timeout=timeout):
+            self._rec_write_lock.release()
+            return True
+        self.log_error(f"等待写入超时({timeout:.0f}s), 在途episode可能不完整")
+        return False
+
+    def rec_str(self):
+        if self._recording():
+            return f"REC:ep{self.rec_ep:04d}"
+        return "REC:-"
 
     def trigger_str(self):
         if self.trig_value is None:
@@ -550,7 +758,8 @@ class MasterBridge(Node):
                       if self.slave_gripper is not None else 0.0)
             tgt = self.grip_target if self.grip_target is not None else 0.0
             self.log(
-                f"[跟随] 夹爪 目标{tgt:.2f}rad 实际{actual:.2f}rad "
+                f"[跟随] {self.rec_str()} | 夹爪 目标{tgt:.2f}rad "
+                f"实际{actual:.2f}rad "
                 f"偏差{actual - tgt:+.2f}rad | {self.trigger_str()}")
 
 
@@ -578,6 +787,28 @@ def main():
                    help='启动时交互标定扳机行程(6秒内松开->按到底->松开)')
     p.add_argument('--no-gravity-comp', action='store_true',
                    help='禁用启动时自动激活主臂重力补偿(默认激活)')
+    p.add_argument('--task', default='demo',
+                   help='数采任务(自然语言指令, 如 '
+                        '"pick up the cube and put it in the bin")')
+    p.add_argument('--rec-format', choices=['lerobot', 'bag'],
+                   default='lerobot',
+                   help='数采落盘格式(默认lerobot=直接LeRobot v3数据集; '
+                        'bag=原始rosbag, 事后用make_dataset.sh转换)')
+    p.add_argument('--dataset', default='zbl_data',
+                   help='LeRobot数据集名(默认zbl_data, 增量追加)')
+    p.add_argument('--data-root', default='/home/xr/lerobot_data',
+                   help='LeRobot数据集根目录(容器内路径)')
+    p.add_argument('--action-mode', choices=['ee', 'joints'], default='ee',
+                   help='动作空间: ee=末端xyz+6D姿态+夹爪(10维), '
+                        'joints=6关节+夹爪(7维)')
+    p.add_argument('--fps', type=float, default=30.0,
+                   help='数据集帧率(默认30, 相机主轴)')
+    p.add_argument('--trim', type=float, default=0.5,
+                   help='每集掐头去尾秒数(默认0.5, 0关闭)')
+    p.add_argument('--rec-dir', default='/home/xr/workspace/recordings',
+                   help='bag格式的录制根目录(容器内路径)')
+    p.add_argument('--no-rec', action='store_true',
+                   help='禁用sw1手柄按键的数采开/停功能')
     p.add_argument('--engage', action='store_true',
                    help='实际控制从臂(默认干跑只打印)')
     p.add_argument('--port', type=int, default=9870,
@@ -622,8 +853,11 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        log_line("退出中: 等待在途数据写入完成(视频编码可能需数十秒)...")
+        node.wait_rec_writes()
         if activated:
             node.soft_stop()
+        node.rec_stop(sync=True)   # 若在录制中, 同步写完最后一集再退出
         rx_proc.terminate()
         try:
             node.destroy_node()

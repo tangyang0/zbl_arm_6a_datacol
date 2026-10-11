@@ -77,6 +77,18 @@ python3 master_bridge.py --engage
 自动流程: 切 joint_position_controller → 2s缓冲 → 低速预对齐到主臂当前构型
 → 100Hz 实时跟随。主臂急动被 vmax=1.5rad/s 软限; 更温和用 --vmax 1.0。
 
+**主臂手柄按键布局**(2026-10-11 实机测定; 注意sw编号是固件逻辑名,
+与物理排列不一致):
+
+| 物理位置(左→右) | 数据字段 | 功能 |
+|---|---|---|
+| 第1个 | sw2 | 空闲 |
+| 第2个 | sw1 | **数采录制 开/停**(短按切换) |
+| 第3个 | sw3 | 空闲 |
+| 第4个 | sw4 | 空闲 |
+| 扳机 | trigger | 夹爪比例开合(0~1) |
+| 摇杆 | joystick_x/y | 空闲(单臂不用; 厂家整机用于底盘/头部) |
+
 夹爪(扳机映射接入前的手动方式, 另开一个容器终端):
 ```bash
 python3 gripper_pub.py 1.2   # 张开(0~4.5)
@@ -115,10 +127,67 @@ ros2 control switch_controllers --deactivate joint_position_controller cart_pose
 docker cp /home/tangyang/workspace/zbl_arm_6a_teleop/. zbl_arm_6a_sdk:/home/xr/workspace/zbl_arm_6a_teleop/
 ```
 
-容器重建/删除后, 同样执行上面这条同步, 再补装一次依赖:
+容器若被删除, 用已烘焙依赖的镜像重建(含torch/lerobot和workspace文件):
 
 ```bash
-docker exec zbl_arm_6a_sdk bash -c 'mkdir -p /home/xr/workspace/zbl_arm_6a_teleop && pip3 install websockets'
+docker run -d --name zbl_arm_6a_sdk --hostname robo2 --network host \
+  --privileged --shm-size 2g \
+  -v /dev:/dev:rw -v /etc/localtime:/etc/localtime:ro \
+  -v /etc/timezone:/etc/timezone:ro -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v /home/tangyang/lerobot_data:/home/xr/lerobot_data \
+  -e ROS2_DISTRO=jazzy -e DISPLAY=:1 -e QT_X11_NO_MITSHM=1 \
+  -e DEBIAN_FRONTEND=noninteractive -w /home/xr \
+  zbl_arm_6a_sdk_image:v0.1.1-py \
+  bash -i -c "echo 'Development environment ready!' && while sleep 1000; do :; done"
+# 然后照常: docker exec -it zbl_arm_6a_sdk bash
+#          ros2 launch zbl_arm_6a_description test_single_arm.launch.py can_interface:=can4 &
+# 若厂家更新镜像(v0.1.2等), 需重新: pip3 install websocket-client websockets h5py \
+#   torch==2.10.0+cpu torchvision==0.25.0+cpu -i https://download.pytorch.org/whl/cpu && \
+#   pip3 install lerobot==0.4.4 && docker cp 同步脚本
 ```
 
-(数采 record_data.sh 暂缓使用, 遥操跑顺后再启用。)
+## 7. 数据采集(数采) → wall-x 训练数据
+
+**默认直接录成 LeRobot v3 格式**(wall-x训练格式, 无需事后转换):
+
+```bash
+# 容器内启动遥操, --task 用自然语言任务指令(VLA微调任务标签):
+python3 master_bridge.py --engage --task "pick up the cube and put it in the bin"
+# 遥操中 短按主臂手柄sw1 = 开始/结束一个episode
+#   - 每集停止后数秒完成视频编码并增量追加到数据集(后台进行, 不影响遥操)
+#   - Ctrl+C退出时同步写完最后一集
+# 数据集直接落在宿主机(容器已挂载): ~/lerobot_data/zbl_data/
+#   拷给训练机 -> wall-x compute_norm_stats.py -> 训练
+```
+
+录制相关参数:
+- `--task "..."` 自然语言任务标签(进LeRobot tasks元数据)
+- `--dataset zbl_data` 数据集名(增量追加; 换名=开新数据集)
+- `--action-mode ee|joints`  ee(默认)=末端xyz+6D姿态+夹爪10维;
+  joints=6关节+夹爪7维
+- `--fps 30` 帧率(以相机时间戳为主轴, 200Hz原始流最近邻对齐)
+- `--trim 0.5` 每集掐头去尾秒数(0关闭)
+- `--rec-format bag` 备选: 录原始rosbag(保200Hz原始数据),
+  事后 `bash make_dataset.sh` 一键转换(bag->h5->LeRobot)
+- 注意: 同一数据集内图像有无需一致(中途开/关过相机就换个数据集名)
+
+备选转换链(make_dataset.sh / bag2hdf5.py / h5_to_lerobot.py)仍在仓库,
+供bag模式或重转历史数据使用; h5_to_lerobot.py 需宿主机 zbl_lerobot 环境。
+
+**容器镜像说明**: 当前容器由 `zbl_arm_6a_sdk_image:v0.1.1-py` 创建
+(在厂家v0.1.1基础上commit了 torch-cpu/lerobot/websockets/h5py 和
+workspace文件, 并挂载 ~/lerobot_data)。容器重建命令见下节。
+
+数据集内容: observation.state(7=6关节+夹爪0~1), action(10或7),
+observation.images.wrist(相机视频), 任务标签来自--task自然语言指令。
+训练侧: 拷~/lerobot_data/<repo_id>到训练机, 用wall-x的
+scripts/compute_norm_stats.py算归一化统计后再训练。
+
+转换环境(宿主机, 已建好): conda env `zbl_lerobot`
+(torch 2.10.0+cpu / torchvision 0.25.0+cpu / **lerobot==0.4.4** / h5py)。
+重建: conda create -n zbl_lerobot python=3.11 && pip install
+torch==2.10.0+cpu torchvision==0.25.0+cpu --index-url
+https://download.pytorch.org/whl/cpu && pip install lerobot==0.4.4 h5py pandas
+
+注意: rosbag2要求录制输出目录不存在(由桥接自动处理);
+episode目录名=任务指令清洗后(空格转下划线)。

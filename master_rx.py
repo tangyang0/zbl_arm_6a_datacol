@@ -86,8 +86,13 @@ def main():
                         sock.sendto(("TRIG " + json.dumps(m)).encode(), dest)
                     elif "_joystick/input" in t:
                         sock.sendto(("JOY " + json.dumps(m)).encode(), dest)
-        except websockets.exceptions.TimeoutError:
-            log_line("5秒无数据(链路或服务端异常)")
+        except TimeoutError:
+            # websockets 17.x: recv超时抛内建TimeoutError(旧版才在exceptions下)
+            log_line("5秒无数据(链路或服务端异常), 重连")
+            time.sleep(1.0)
+        except KeyboardInterrupt:
+            log_line("收到退出信号")
+            break
         except Exception as e:
             log_line(f"连接断开({e}), 3秒后重连")
             time.sleep(3.0)
