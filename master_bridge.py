@@ -4,7 +4,8 @@
 在从臂SDK容器内运行(rclpy来自 /opt/xr/core/install/setup.bash):
     python3 master_bridge.py            # 干跑: 只打印主臂->映射后的关节角, 不发指令
     python3 master_bridge.py --engage   # 预对齐后进入实时跟随
-启动时默认自动激活主臂重力补偿(--no-gravity-comp 可关闭)
+启动时默认: 主从臂同步限速回零(--no-master-zero跳过) -> 激活主臂重力补偿
+(--no-gravity-comp 可关闭)
 
 数据源: 独立进程master_rx.py(rosbridge->UDP), 订阅/joint_states(约200Hz)
         与 /joy_trigger/state/<side>(扳机)
@@ -22,7 +23,6 @@ import datetime
 import json
 import math
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -37,20 +37,11 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Float64MultiArray
 from controller_manager_msgs.srv import SwitchController
 
-from lerobot_writer import EpisodeBuffer, write_episode
+from lerobot_writer import EpisodeBuffer, write_episode, task_dirname
 
 # 从臂关节限位(来源: examples/python/joint_control.py, rad)
 SLAVE_LOWER = [-2.792, 0.0, -3.14, -1.57, -1.4, -1.745]
 SLAVE_UPPER = [2.792, 3.44, 0.0, 1.57, 1.4, 1.745]
-
-# 数采录制话题: 观测(joint_states含夹爪反馈/end_pose/图像) + 动作(两路指令)
-REC_TOPICS = [
-    "/joint_states",
-    "/joint_position_controller/commands",
-    "/gripper_controller/commands",
-    "/arm/end_pose",
-    "/eye_in_hand/eye_in_hand/image_raw/image_compressed",
-]
 
 
 # 日志级别配色(ANSI): 数采各状态一眼可辨
@@ -115,6 +106,7 @@ class MasterBridge(Node):
         self.slave_joints = None
         self.slave_gripper = None       # 从臂夹爪位置(rad, 0=合, 满开~4.5)
         self.last_cmd = None
+        self._follow_enabled = False    # 启动阶段(归零/对齐)先挡住tick的跟随发布
         self.trigger_count = 0
         self._last_log = -1
         self.joy_count = 0
@@ -150,10 +142,7 @@ class MasterBridge(Node):
         self.udp.setblocking(False)
 
         # 数采: 主臂手柄sw1短按 开/停一个episode
-        # 默认lerobot格式直接落盘; --rec-format bag 保留原始bag路线
-        self.task_dir = self.sanitize_task(args.task)   # 任务目录名
-        self.rec_buf = None        # lerobot格式的episode缓冲
-        self.rec_proc = None
+        self.rec_buf = None        # episode缓冲(录制中在内存累积原始流)
         self._rec_write_lock = threading.Lock()   # LeRobot写入串行化
         self.rec_dir = None          # 当前episode目录
         self.rec_t0 = None
@@ -237,6 +226,138 @@ class MasterBridge(Node):
             return False
         except Exception as e:
             self.log_error(f"主臂重力补偿激活异常: {e}")
+            return False
+
+    # ---------- 主臂关节归零(位置伺服回零后交回重力补偿) ----------
+    def _udp_latest_mj(self, wait=0.5):
+        """从UDP流取最新一帧主臂关节角(归零到位反馈), 无则None"""
+        pos, t0 = None, time.time()
+        while time.time() - t0 < wait:
+            try:
+                data, _ = self.udp.recvfrom(2048)
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            if data.startswith(b"MJ "):
+                try:
+                    pos = [float(v) for v in data[3:].split()]
+                except ValueError:
+                    pass
+        return pos
+
+    def hold_slave(self, dur=2.0):
+        """激活从臂控制器后立即以rate频率发布当前关节角:
+        覆盖控制器可能保持的上一会话旧目标, 消除激活瞬间的窜动"""
+        self.log(f"从臂控制器已激活, 以当前位姿保持{dur:.0f}s(覆盖旧目标)...")
+        t0 = time.time()
+        while time.time() - t0 < dur:
+            rclpy.spin_once(self, timeout_sec=0.01)
+            if self.slave_joints is not None and \
+                    all(math.isfinite(v) for v in self.slave_joints):
+                self.publish_joints(list(self.slave_joints))
+            time.sleep(1.0 / self.args.rate)
+
+    def zero_master(self, timeout=20.0, tol=0.05, move_slave=False):
+        """主臂(可选连同从臂)关节位置归零: 主臂切关节位置伺服, 主从各自从
+        当前角度限速缓动收敛到0(move_slave时从臂经joint_position_controller
+        同步缓动, 一次运动完成)。归零完成后由随后的enable_master_gravity
+        交回重力补偿(主臂在零位变为自由)。超时/失败不阻塞启动, 只告警。"""
+        import websocket as _ws
+        jc = f"master_{self.args.side}_arm_joint_controller"
+        gc = f"{self.args.side}_gravity_compensate_controller"
+        cart = f"master_{self.args.side}_arm_cartesian_controller"
+        topic = f"/{jc}/commands"
+        who = "主从臂同步" if move_slave else "主臂"
+        self.log(f"★ 3秒后{who}将限速缓动回零, 请勿手持主臂, "
+                 f"确保主从臂周围无人!", "INFO")
+        time.sleep(3.0)
+        try:
+            ws = _ws.create_connection(self.args.master, timeout=5)
+        except Exception as e:
+            self.log_error(f"主臂归零: rosbridge连接失败({e}), 跳过")
+            return False
+        try:
+            ok = self._master_switch(ws, activate=[jc], deactivate=[gc, cart])
+            if ok is not True:   # 接口被占时FORCE_AUTO再试一次
+                ok = self._master_switch(ws, activate=[jc], deactivate=[],
+                                         strictness=4)
+            if ok is not True:
+                self.log_error("主臂归零: 关节位置伺服激活失败, 跳过归零")
+                ws.close()
+                return False
+            ws.send(json.dumps({"op": "advertise", "topic": topic,
+                                "type": "std_msgs/msg/Float64MultiArray"}))
+            # 限速缓动回零: 从各自当前角度线性收敛到0, 不直接下发0(会全速冲)
+            m0 = self._udp_latest_mj(1.0)
+            if m0 is None or len(m0) != 6:
+                ws.send(json.dumps({"op": "unadvertise", "topic": topic}))
+                ws.close()
+                self.log_error("主臂归零: 无关节反馈流, 跳过")
+                return False
+            q0 = None
+            if move_slave:
+                t0 = time.time()
+                while time.time() - t0 < 2.0 and (
+                        self.slave_joints is None):
+                    rclpy.spin_once(self, timeout_sec=0.05)
+                if self.slave_joints is not None and \
+                        all(math.isfinite(v) for v in self.slave_joints):
+                    q0 = list(self.slave_joints)
+                else:
+                    self.log_error("从臂关节数据无效, 本次仅主臂回零")
+            vmax = self.args.master_zero_vmax
+            m_max = max(abs(v) for v in m0)
+            s_max = max((abs(v) for v in q0), default=0.0)
+            dur = max(m_max, s_max) / vmax if vmax > 0 else 0.0
+            msg = f"主臂最大{math.degrees(m_max):.0f}°"
+            if q0 is not None:
+                msg += f", 从臂最大{math.degrees(s_max):.0f}°"
+            self.log(f"{who}回零: {msg}, 限速{vmax:.2f}rad/s, "
+                     f"预计{dur:.1f}s")
+            t0, err_m, err_s = time.time(), None, None
+            while time.time() - t0 < dur + timeout:
+                el = time.time() - t0
+                s = max(0.0, 1.0 - el / dur) if dur > 0 else 0.0
+                ws.send(json.dumps({"op": "publish", "topic": topic, "msg": {
+                    "layout": {"dim": [], "data_offset": 0},
+                    "data": [v * s for v in m0]}}))
+                if q0 is not None:
+                    rclpy.spin_once(self, timeout_sec=0.0)
+                    self.publish_joints(
+                        self.clamp_step([v * s for v in q0]))
+                    if self.slave_joints is not None:
+                        err_s = max(abs(v) for v in self.slave_joints)
+                cur = self._udp_latest_mj(0.05)
+                if cur is not None and len(cur) == 6:
+                    err_m = max(abs(v) for v in cur)
+                done = (s <= 0.0 and err_m is not None and err_m < tol and
+                        (q0 is None or
+                         (err_s is not None and err_s < tol)))
+                if done:
+                    break
+                time.sleep(0.05)
+            try:
+                ws.send(json.dumps({"op": "unadvertise", "topic": topic}))
+            except Exception:
+                pass
+            ws.close()
+            ok_m = err_m is not None and err_m < tol
+            ok_s = q0 is None or (err_s is not None and err_s < tol)
+            if ok_m and ok_s:
+                res = f"主臂偏差{err_m:.3f}rad"
+                if q0 is not None:
+                    res += f", 从臂偏差{err_s:.3f}rad"
+                self.log(f"{who}已归零到位({res}, 耗时{time.time() - t0:.1f}s)")
+                return True
+            res = (f"主臂{err_m:.3f}" if err_m is not None else "主臂无反馈")
+            if q0 is not None:
+                res += (f", 从臂{err_s:.3f}" if err_s is not None
+                        else ", 从臂无反馈")
+            self.log_error(f"{who}归零超时(缓动{dur:.0f}s+收敛{timeout:.0f}s, "
+                           f"当前偏差{res}rad), 继续启动")
+            return False
+        except Exception as e:
+            self.log_error(f"主臂归零异常: {e}")
             return False
 
     # ---------- 主臂侧(UDP, 数据来自独立进程master_rx.py) ----------
@@ -504,7 +625,7 @@ class MasterBridge(Node):
         dist = max(abs(t - c) for t, c in zip(target, cur))
         if dist < 0.02:
             return True
-        dur = dist / (self.args.vmax / 3.0)
+        dur = dist / self.args.align_vmax
         steps = max(int(dur * self.args.rate), 2)
         self.log(
             f"预对齐: 最大关节偏差 {math.degrees(dist):.1f}°, "
@@ -563,84 +684,67 @@ class MasterBridge(Node):
             self.rec_buf.ag_ts.append(time.perf_counter())
 
     # ---------- 数采录制(sw1短按开/停episode) ----------
-    @staticmethod
-    def sanitize_task(text):
-        """自然语言任务文本 -> 目录名(中文/字母数字保留, 其余转下划线)"""
-        out = ''.join(
-            c if (c.isalnum() or c in '-_') else '_' for c in text.strip())
-        return out[:60] or 'demo'
+    def rec_ds_root(self):
+        """本集的目标数据集目录: <data_root>/<数据集名>/<任务名>/"""
+        return os.path.join(self.args.data_root, self.args.dataset,
+                            task_dirname(self.args.task))
 
     def _scan_episodes(self):
-        if self.args.rec_format == "bag":
-            base = os.path.join(self.args.rec_dir, self.task_dir)
-            try:
-                os.makedirs(base, exist_ok=True)
-                eps = [d for d in os.listdir(base)
-                       if d.startswith("episode_")]
-                self.rec_ep = len(eps)
-            except Exception:
-                self.rec_ep = 0
-        else:   # lerobot: episode计数来自已有数据集
-            info = os.path.join(
-                self.args.data_root, self.args.dataset, "meta", "info.json")
-            try:
-                with open(info) as f:
-                    self.rec_ep = json.load(f)["total_episodes"]
-            except Exception:
-                self.rec_ep = 0
+        # episode计数来自本任务的已有数据集
+        info = os.path.join(self.rec_ds_root(), "meta", "info.json")
+        try:
+            with open(info) as f:
+                self.rec_ep = json.load(f)["total_episodes"]
+        except Exception:
+            self.rec_ep = 0
 
     def _recording(self):
-        return self.rec_proc is not None or self.rec_buf is not None
+        return self.rec_buf is not None
+
+    def _check_dataset_schema(self, info_path):
+        """已有数据集schema与当前录制格式不符时返回差异列表(用于开录前拒绝)"""
+        try:
+            with open(info_path) as f:
+                meta = json.load(f)
+        except Exception:
+            return []                      # 元数据读不了就不拦, 写入时还有兜底报错
+        feats = meta.get("features", {})
+        want = {
+            "observation.state": 10,
+            "observation.joints": 7,
+            "action": 10 if self.args.action_mode == "ee" else 7,
+        }
+        bad = []
+        for k, d in want.items():
+            got = feats.get(k, {}).get("shape", [None])[0]
+            if got != d:
+                bad.append(f"{k}: 数据集{got if got is not None else '无此键'}维"
+                           f" vs 录制{d}维")
+        if meta.get("fps") and int(meta["fps"]) != int(self.args.fps):
+            bad.append(f"fps: 数据集{meta['fps']} vs 录制{self.args.fps}")
+        return bad
 
     def rec_toggle(self):
         if self._recording():
             self.rec_stop()
             return
+        # 开录前格式预检: 不符立即拒绝, 避免录完整集才在写入时报错白录
+        info = os.path.join(self.rec_ds_root(), "meta", "info.json")
+        if os.path.exists(info):
+            bad = self._check_dataset_schema(info)
+            if bad:
+                self.log(f"✗✗✗ 拒绝录制: 数据集{self.args.dataset}与当前录制格式"
+                         f"不符({'; '.join(bad)}), 请换 --dataset 名称", "REC✗")
+                return
         self.rec_ep += 1
-        if self.args.rec_format == "bag":
-            ep_dir = os.path.join(
-                self.args.rec_dir, self.task_dir,
-                f"episode_{self.rec_ep:04d}")
-            self.rec_dir = ep_dir
-            self.rec_t0 = time.time()
-            self.rec_proc = subprocess.Popen(
-                ["ros2", "bag", "record", "-o", ep_dir, "--topics"]
-                + REC_TOPICS,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # rosbag2要求输出目录不存在(由它创建), 等目录建好后再写任务标签
-            for _ in range(20):
-                if os.path.isdir(ep_dir):
-                    break
-                time.sleep(0.1)
-            try:
-                with open(os.path.join(ep_dir, "instruction.txt"), "w",
-                          encoding="utf-8") as f:
-                    f.write(self.args.task.strip() + "\n")
-            except OSError as e:
-                self.log_error(f"写入instruction.txt失败: {e}")
-            self.log(f"▶▶▶ episode_{self.rec_ep:04d} 开始录制 -> {ep_dir} "
-                     f"任务: {self.args.task}", "REC▶")
-        else:   # lerobot: 直接在内存累积原始流, 停止时写数据集
-            self.rec_buf = EpisodeBuffer()
-            self.rec_dir = os.path.join(
-                self.args.data_root, self.args.dataset)
-            self.rec_t0 = time.time()
-            self.log(f"▶▶▶ episode_{self.rec_ep:04d} 开始录制 -> LeRobot数据集 "
-                     f"{self.rec_dir} 任务: {self.args.task}", "REC▶")
+        self.rec_buf = EpisodeBuffer()   # 内存累积原始流, 停止时写数据集
+        self.rec_dir = os.path.join(self.args.data_root, self.args.dataset)
+        self.rec_t0 = time.time()
+        self.log(f"▶▶▶ episode_{self.rec_ep:04d} 开始录制 -> LeRobot数据集 "
+                 f"{self.rec_ds_root()} 任务: {self.args.task}", "REC▶")
 
     def rec_stop(self, sync=False):
-        if self.rec_proc is not None:      # bag路径
-            self.rec_proc.send_signal(signal.SIGINT)
-            try:
-                self.rec_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.rec_proc.kill()
-            self.log(f"■ episode_{self.rec_ep:04d} 结束, "
-                     f"时长{time.time() - self.rec_t0:.1f}s, 数据在容器内 "
-                     f"{self.rec_dir}", "REC…")
-            self.rec_proc = None
-            return
-        if self.rec_buf is None:           # lerobot路径
+        if self.rec_buf is None:
             return
         buf, ep = self.rec_buf, self.rec_ep
         dur = time.time() - self.rec_t0
@@ -658,8 +762,7 @@ class MasterBridge(Node):
             with self._rec_write_lock:
                 try:
                     n = write_episode(
-                        buf, self.rec_dir, self.args.dataset,
-                        self.args.task.strip(),
+                        buf, self.rec_dir, self.args.task.strip(),
                         action_mode=self.args.action_mode,
                         fps=self.args.fps, trim=self.args.trim,
                         grip_max=self.args.gripper_max)
@@ -739,10 +842,12 @@ class MasterBridge(Node):
             now = int(time.time() * 2)
             if now != self._last_log:
                 self._last_log = now
-                self.log(
-                    f"[干跑] 主臂关节: {['%.3f' % v for v in master]} | "
-                    f"{self.gripper_str()} | {self.trigger_str()}")
+            self.log(
+                f"[干跑] 主臂关节: {['%.3f' % v for v in master]} | "
+                f"{self.gripper_str()} | {self.trigger_str()}")
             return
+        if not self._follow_enabled:
+            return   # 启动编排中(回零/对齐), 跟随发布由编排流程接管
         if age > 0.5:
             self.log_throttle(
                 "主臂数据流中断, 暂停跟随(从臂保持当前位置)", 2.0, "WARN")
@@ -764,6 +869,7 @@ class MasterBridge(Node):
 
 
 def main():
+    os.umask(0o000)   # 数据文件对宿主机用户全开放(容器uid与本机不同, 避免带锁)
     p = argparse.ArgumentParser()
     p.add_argument('--side', choices=['left', 'right'], default='right',
                    help='使用哪个主臂(默认right)')
@@ -786,27 +892,29 @@ def main():
     p.add_argument('--calib-trigger', action='store_true',
                    help='启动时交互标定扳机行程(6秒内松开->按到底->松开)')
     p.add_argument('--no-gravity-comp', action='store_true',
-                   help='禁用启动时自动激活主臂重力补偿(默认激活)')
+                   help='跳过启动时激活主臂重力补偿')
+    p.add_argument('--no-master-zero', action='store_true',
+                   help='跳过启动时主臂关节位置归零(默认: 归零后交回重力补偿;'
+                        ' 仅在启用重力补偿时生效)')
+    p.add_argument('--master-zero-vmax', type=float, default=0.3,
+                   help='主从回零缓动限速rad/s(默认0.3, 想更慢再调小)')
+    p.add_argument('--align-vmax', type=float, default=0.3,
+                   help='从臂预对齐缓动限速rad/s(默认0.3, 与主臂回零同节奏)')
     p.add_argument('--task', default='demo',
                    help='数采任务(自然语言指令, 如 '
                         '"pick up the cube and put it in the bin")')
-    p.add_argument('--rec-format', choices=['lerobot', 'bag'],
-                   default='lerobot',
-                   help='数采落盘格式(默认lerobot=直接LeRobot v3数据集; '
-                        'bag=原始rosbag, 事后用make_dataset.sh转换)')
     p.add_argument('--dataset', default='zbl_data',
                    help='LeRobot数据集名(默认zbl_data, 增量追加)')
-    p.add_argument('--data-root', default='/home/xr/lerobot_data',
-                   help='LeRobot数据集根目录(容器内路径)')
+    p.add_argument('--data-root', default='/home/xr/workspace/zbl_arm_6a_datacol/data',
+                   help='数据集根目录(容器内路径, 建议保持挂载到仓库内)')
     p.add_argument('--action-mode', choices=['ee', 'joints'], default='ee',
                    help='动作空间: ee=末端xyz+6D姿态+夹爪(10维), '
                         'joints=6关节+夹爪(7维)')
-    p.add_argument('--fps', type=float, default=30.0,
-                   help='数据集帧率(默认30, 相机主轴)')
+    p.add_argument('--fps', type=float, default=20.0,
+                   help='数据集目标帧率(默认20, 与模型预训练一致, '
+                        '各流最近邻对齐重采样)')
     p.add_argument('--trim', type=float, default=0.5,
                    help='每集掐头去尾秒数(默认0.5, 0关闭)')
-    p.add_argument('--rec-dir', default='/home/xr/workspace/recordings',
-                   help='bag格式的录制根目录(容器内路径)')
     p.add_argument('--no-rec', action='store_true',
                    help='禁用sw1手柄按键的数采开/停功能')
     p.add_argument('--engage', action='store_true',
@@ -827,8 +935,6 @@ def main():
 
     rclpy.init()
     node = MasterBridge(args)
-    if not args.no_gravity_comp:
-        node.enable_master_gravity()
     engaged = False
     activated = False   # 控制器已切换成功(此后任何退出路径都必须软急停)
     try:
@@ -842,9 +948,15 @@ def main():
                                             "zero_force_dragging_controller"]):
                 raise SystemExit("切换到关节位置模式失败")
             activated = True
-            time.sleep(1.0)
+            node.hold_slave(2.0)   # 激活后立即保持当前位姿, 消除旧目标窜动
+        if not args.no_gravity_comp:
+            if not args.no_master_zero:
+                node.zero_master(move_slave=args.engage)   # 主从同步缓动回零
+            node.enable_master_gravity()
+        if args.engage:
             if not node.prealign(node.master_joints):
                 raise SystemExit("预对齐失败")
+            node._follow_enabled = True
             engaged = True
             node.log("=== 实时跟随已启动(Ctrl+C 安全退出) ===")
         ex = SingleThreadedExecutor()
