@@ -6,10 +6,37 @@
 
 | 位置 | 路径 |
 |---|---|
-| 脚本源(宿主机) | /home/tangyang/workspace/zbl_arm_6a_datacol/ |
+| 脚本源(宿主机) | ~/workspace/zbl_arm_6a_datacol/ |
 | 运行位置(容器内) | /home/xr/workspace/zbl_arm_6a_datacol/ |
 
-两侧是独立拷贝(**没有挂载**), 宿主机改完脚本后执行同步(见第6节)。
+整个仓库目录**直接挂载**进容器(两侧即时互通, 宿主机是唯一真源)。
+
+## 0. 首次部署(新机器只做一次)
+
+**0.1 获取镜像**(二选一):
+```bash
+# 方式A(推荐): 从GitHub Container Registry拉取
+docker pull ghcr.io/tangyang0/zbl_arm_6a_datacol:v0.1.0
+docker tag ghcr.io/tangyang0/zbl_arm_6a_datacol:v0.1.0 zbl_arm_6a_datacol_image:v0.1.0
+
+# 方式B(兜底): 本机已有厂家镜像 zbl_arm_6a_sdk_image:v0.1.1 时一键重建等价镜像
+bash build_image.sh
+```
+
+**0.2 克隆仓库并创建容器**(宿主机):
+```bash
+git clone https://github.com/tangyang0/zbl_arm_6a_datacol.git ~/workspace/zbl_arm_6a_datacol
+chmod -R a+rwX ~/workspace/zbl_arm_6a_datacol   # 开放权限(容器uid与本机用户不同)
+docker run -d --name zbl_arm_6a_sdk --network host \
+  --privileged --shm-size 2g \
+  -v /dev:/dev:rw -v /etc/localtime:/etc/localtime:ro \
+  -v /etc/timezone:/etc/timezone:ro -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v /home/$USER/workspace/zbl_arm_6a_datacol:/home/xr/workspace/zbl_arm_6a_datacol \
+  -e ROS2_DISTRO=jazzy -e DISPLAY=:1 -e QT_X11_NO_MITSHM=1 \
+  -e DEBIAN_FRONTEND=noninteractive -w /home/xr \
+  zbl_arm_6a_datacol_image:v0.1.0 \
+  bash -i -c "echo 'Development environment ready!' && while sleep 1000; do :; done"
+```
 
 ## 1. 上电启动(每次)
 
@@ -72,6 +99,8 @@ python3 master_bridge.py              # 右主臂(默认); 左臂加 --side left
 手持主臂缓慢运动, 确认打印的关节角跟随、数值在从臂限位内:
 J1 ±2.792, J2 0~3.44, J3 -3.14~0, J4 ±1.57, J5 ±1.4, J6 ±1.745 (rad)
 Ctrl+C 退出。
+> 干跑启动同样会执行: 主臂缓动回零 → 主臂重力补偿(干跑不控制从臂,
+> 跳过用 --no-master-zero / --no-gravity-comp)。
 
 ## 3. 实时遥操作
 
@@ -80,13 +109,12 @@ Ctrl+C 退出。
 python3 master_bridge.py --engage
 ```
 自动流程: 从臂切 joint_position_controller 并以当前位姿保持2s(覆盖旧目标,
-防激活窜动) → 主从臂**同步**限速缓动回零(3s安全提示, 默认0.3rad/s,
+防激活窜动) → 保持结束**立即**主从臂同步限速缓动回零(默认0.3rad/s,
 --master-zero-vmax可调, --no-master-zero跳过) → 主臂重力补偿
 → 残余预对齐(回零后通常瞬间完成) → 100Hz 实时跟随。
-主臂急动被 vmax=1.5rad/s 软限; 更温和用 --vmax 1.0。
+主臂急动被 vmax=3.0rad/s 软限; 更温和用 --vmax 1.5。
 
-**主臂手柄按键布局**(2026-10-11 实机测定; 注意sw编号是固件逻辑名,
-与物理排列不一致):
+**主臂手柄按键布局**(实机测定; sw编号是固件逻辑名,与物理排列不一致):
 
 | 物理位置(左→右) | 数据字段 | 功能 |
 |---|---|---|
@@ -108,9 +136,18 @@ ros2 control switch_controllers --deactivate joint_position_controller cart_pose
 |---|---|---|
 | --side | right | 用右主臂还是左主臂 |
 | --master | ws://192.168.31.7:9090 | 主臂PC rosbridge地址 |
-| --rate | 100 | 从臂指令频率Hz |
-| --vmax | 1.5 | 软限最大关节角速度rad/s |
 | --engage | 关 | 不加只干跑打印, 加了才真控制 |
+| --rate | 100 | 从臂指令频率Hz |
+| --vmax | 3.0 | 跟随软限最大关节角速度rad/s |
+| --task | demo | 数采任务指令(自然语言, 见§7) |
+| --dataset | zbl_data | 数据集分组名(其下按任务自动分目录) |
+| --action-mode | ee | ee=末端10维; joints=关节7维 |
+| --fps | 20 | 数据集帧率(与模型预训练一致) |
+| --trim | 0.5 | 每集掐头去尾秒数 |
+| --master-zero-vmax | 0.3 | 主从回零缓动限速rad/s |
+| --align-vmax | 0.3 | 残余预对齐缓动限速rad/s |
+| --no-master-zero / --no-gravity-comp / --no-rec | 关 | 跳过启动回零/重力补偿/关闭sw1录制 |
+| --calib-trigger | 关 | 启动时交互标定扳机行程 |
 
 ## 5. 注意事项
 
@@ -119,38 +156,24 @@ ros2 control switch_controllers --deactivate joint_position_controller cart_pose
 - WiFi 抖动(本机↔主臂PC ping 3~100ms)导致跟手卡顿的话, 两台机器接有线。
 - 主臂若与从臂镜像摆放, 需在 clamp_step 前加符号映射。
 
-## 6. 宿主机 → 容器 同步脚本
+## 6. 镜像与维护
 
-宿主机改了脚本后, 执行一次即可让容器内生效:
+镜像 `zbl_arm_6a_datacol_image:v0.1.0`(初版数采镜像, 6.73GiB):
+厂家v0.1.1 + torch-cpu/lerobot==0.4.4/websockets/websocket-client
+(数采录制依赖) + git跨属主safe.directory例外, 单层压平。
 
+`build_image.sh` = 用厂家镜像一键重建等价数采镜像的脚本
+(装依赖 → safe.directory → 清缓存 → export/import压平),
+厂家更新SDK或依赖变化时改脚本内版本号重跑, 递增tag(如v0.2.0)。
+新版本镜像推到ghcr.io供学生pull(见第0节):
 ```bash
-docker cp /home/tangyang/workspace/zbl_arm_6a_datacol/. zbl_arm_6a_sdk:/home/xr/workspace/zbl_arm_6a_datacol/
-# docker cp会保留宿主机uid(1007), 容器内xr(1001)会写不了文件(VSCode保存报EACCES),
-# 同步后必须归还属主:
-docker exec -u root zbl_arm_6a_sdk chown -R xr:xr /home/xr/workspace/zbl_arm_6a_datacol
+docker tag zbl_arm_6a_datacol_image:v0.2.0 ghcr.io/tangyang0/zbl_arm_6a_datacol:v0.2.0
+docker push ghcr.io/tangyang0/zbl_arm_6a_datacol:v0.2.0
 ```
 
-容器若被删除, 用已烘焙依赖的镜像重建(含torch/lerobot和workspace文件):
-
-```bash
-docker run -d --name zbl_arm_6a_sdk --hostname robo2 --network host \
-  --privileged --shm-size 2g \
-  -v /dev:/dev:rw -v /etc/localtime:/etc/localtime:ro \
-  -v /etc/timezone:/etc/timezone:ro -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  -v /home/tangyang/lerobot_data:/home/xr/lerobot_data \
-  -v /home/tangyang/workspace/zbl_arm_6a_datacol/data:/home/xr/workspace/zbl_arm_6a_datacol/data \
-  -e ROS2_DISTRO=jazzy -e DISPLAY=:1 -e QT_X11_NO_MITSHM=1 \
-  -e DEBIAN_FRONTEND=noninteractive -w /home/xr \
-  zbl_arm_6a_sdk_image:v0.1.1-py \
-  bash -i -c "echo 'Development environment ready!' && while sleep 1000; do :; done"
-# 注意: 宿主机 data/ 目录必须先手动建好并chmod 777(否则docker以root自动创建,
-# 容器内xr用户写不进去); data/ 已加入.gitignore不进版本库
-# 然后照常: docker exec -it zbl_arm_6a_sdk bash
-#          ros2 launch zbl_arm_6a_description test_single_arm.launch.py can_interface:=can4 &
-# 若厂家更新镜像(v0.1.2等), 需重新: pip3 install websocket-client websockets h5py \
-#   torch==2.10.0+cpu torchvision==0.25.0+cpu -i https://download.pytorch.org/whl/cpu && \
-#   pip3 install lerobot==0.4.4 && docker cp 同步脚本
-```
+权限说明: 宿主机仓库已整体 `chmod -R a+rwX`(容器uid与本机用户不同, 不开放
+则容器内写不了); **宿主机侧 git pull/checkout 后新文件权限是默认umask,
+需补一句 `chmod -R a+rwX ~/workspace/zbl_arm_6a_datacol`** 再让容器内编辑。
 
 ## 7. 数据采集(数采) → wall-x 训练数据
 
@@ -162,7 +185,7 @@ python3 master_bridge.py --engage --task "pick up test tube No. 1 from the left 
 # 遥操中 短按主臂手柄sw1 = 开始/结束一个episode
 #   - 每集停止后数秒完成视频编码并增量追加到数据集(后台进行, 不影响遥操)
 #   - Ctrl+C退出时同步写完最后一集
-# 数据直接落在仓库 data/ 目录(容器内该目录挂载到宿主机仓库, 不需拷贝):
+# 数据直接落在仓库 data/ 目录(仓库整体挂载, 宿主机即时可见, 不需拷贝):
 #   ~/workspace/zbl_arm_6a_datacol/data/zbl_data/<任务名>/
 #   每个任务名目录是一个独立完整的LeRobot数据集(同任务自动增量追加)
 #   训练时 repo_id 指到任务目录 -> wall-x compute_norm_stats.py -> 训练
@@ -176,18 +199,12 @@ python3 master_bridge.py --engage --task "pick up test tube No. 1 from the left 
   joints=6关节+夹爪7维
 - `--fps 20` 目标帧率(与模型预训练一致; 相机/关节/位姿各流最近邻对齐重采样)
 - `--trim 0.5` 每集掐头去尾秒数(0关闭)
-- 注意: 同一数据集内图像有无需一致(中途开/关过相机就换个数据集名)
-
-**容器镜像说明**: 当前容器由 `zbl_arm_6a_sdk_image:v0.1.1-py` 创建
-(在厂家v0.1.1基础上commit了 torch-cpu/lerobot/websockets/h5py 和
-workspace文件, 并挂载 ~/lerobot_data)。容器重建命令见下节。
+- 注意: 同一数据集内图像流需一致(中途开/关过相机就换个 `--dataset` 分组名)
 
 数据集内容: observation.state(10=末端xyz+6D姿态+夹爪, 与预训练agent_pos同构),
 observation.joints(7=6关节+夹爪归一化, 备用), action(10=从臂末端绝对位姿,
 与state同一条从臂流错开一帧, action[i]≡state[i+1], 官方x2robot2lerobot同语义;
 训练侧loader自动转delta; joints模式为7), observation.images.wrist(相机视频),
 任务标签来自--task自然语言指令。
-**注意**: 2026-10-15起状态改为末端10维、帧率20fps, 与旧数据集(zbl_data:
-关节状态@30fps)不兼容, 追加会报维度不匹配——新采集请换 `--dataset` 名。
-训练侧: 拷~/lerobot_data/<repo_id>到训练机, 用wall-x的
-scripts/compute_norm_stats.py算归一化统计后再训练。
+训练侧: 把 `data/zbl_data/<任务名>/` 整个目录拷到训练机, 用wall-x的
+scripts/compute_norm_stats.py算归一化统计后即可训练。
