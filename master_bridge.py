@@ -149,6 +149,8 @@ class MasterBridge(Node):
         self.rec_ep = 0
         self._sw1_prev = False
         self._last_sw1_ts = 0.0
+        self._sw2_prev = False
+        self._home_busy = False       # 运行中主臂回零进行中(防重入/防开录)
         self._scan_episodes()
 
         self.timer = self.create_timer(1.0 / args.rate, self.tick)
@@ -257,7 +259,32 @@ class MasterBridge(Node):
                 self.publish_joints(list(self.slave_joints))
             time.sleep(1.0 / self.args.rate)
 
-    def zero_master(self, timeout=20.0, tol=0.05, move_slave=False):
+    # ---------- 运行中主臂回零(sw2短按) ----------
+    def master_home_toggle(self):
+        """数采中主臂限速回零: 后台线程执行, 跟随循环不停
+        (从臂经正常跟随自动同步到零位); 归零完成后主臂自动恢复重力补偿。"""
+        if self._home_busy:
+            self.log_throttle("主臂回零进行中, 忽略按键", 1.0, "WARN")
+            return
+        if self._recording():
+            self.log("✗ 录制进行中, 先sw1结束本集再按sw2归零", "REC✗")
+            return
+        self._home_busy = True
+        threading.Thread(target=self._master_home_worker, daemon=True).start()
+
+    def _master_home_worker(self):
+        try:
+            ok = self.zero_master(notice=1.0)
+            if self.enable_master_gravity():
+                self.log("主臂回零完成, 已恢复重力补偿" if ok
+                         else "主臂回零未完全到位, 已恢复重力补偿")
+        except Exception as e:
+            self.log_error(f"主臂回零流程异常: {e}")
+        finally:
+            self._home_busy = False
+
+    def zero_master(self, timeout=20.0, tol=0.05, move_slave=False,
+                    notice=3.0):
         """主臂(可选连同从臂)关节位置归零: 主臂切关节位置伺服, 主从各自从
         当前角度限速缓动收敛到0(move_slave时从臂经joint_position_controller
         同步缓动, 一次运动完成)。归零完成后由随后的enable_master_gravity
@@ -268,9 +295,13 @@ class MasterBridge(Node):
         cart = f"master_{self.args.side}_arm_cartesian_controller"
         topic = f"/{jc}/commands"
         who = "主从臂同步" if move_slave else "主臂"
-        self.log(f"★ 3秒后{who}将限速缓动回零, 请勿手持主臂, "
-                 f"确保主从臂周围无人!", "INFO")
-        time.sleep(3.0)
+        if notice > 0:
+            self.log(f"★ {notice:.0f}秒后{who}将限速缓动回零, 请勿手持主臂, "
+                     f"确保主从臂周围无人!", "INFO")
+            time.sleep(notice)
+        else:
+            self.log(f"★ {who}开始限速缓动回零, 请勿手持主臂, "
+                     f"确保主从臂周围无人!", "INFO")
         try:
             ws = _ws.create_connection(self.args.master, timeout=5)
         except Exception as e:
@@ -307,7 +338,7 @@ class MasterBridge(Node):
                     self.log_error("从臂关节数据无效, 本次仅主臂回零")
             vmax = self.args.master_zero_vmax
             m_max = max(abs(v) for v in m0)
-            s_max = max((abs(v) for v in q0), default=0.0)
+            s_max = max((abs(v) for v in (q0 or [])), default=0.0)
             dur = max(m_max, s_max) / vmax if vmax > 0 else 0.0
             msg = f"主臂最大{math.degrees(m_max):.0f}°"
             if q0 is not None:
@@ -454,6 +485,11 @@ class MasterBridge(Node):
                 self._last_sw1_ts = now_pc
                 self.rec_toggle()
             self._sw1_prev = sw1
+        # sw2上升沿(短按): 运行中主臂限速回零(后台线程, 从臂由跟随自动带零)
+        sw2 = bool(m.get("sw2", False))
+        if sw2 and not self._sw2_prev:
+            self.master_home_toggle()
+        self._sw2_prev = sw2
         # 运行期观测范围(供--calib-trigger使用)
         if self._trig_obs_min is None or v < self._trig_obs_min:
             self._trig_obs_min = v
@@ -728,6 +764,9 @@ class MasterBridge(Node):
         if self._recording():
             self.rec_stop()
             return
+        if self._home_busy:
+            self.log("✗ 主臂回零进行中, 稍后再开录", "REC✗")
+            return
         # 开录前格式预检: 不符立即拒绝, 避免录完整集才在写入时报错白录
         info = os.path.join(self.rec_ds_root(), "meta", "info.json")
         if os.path.exists(info):
@@ -951,7 +990,7 @@ def main():
             node.hold_slave(2.0)   # 激活后立即保持当前位姿, 消除旧目标窜动
         if not args.no_gravity_comp:
             if not args.no_master_zero:
-                node.zero_master(move_slave=args.engage)   # 主从同步缓动回零
+                node.zero_master(move_slave=args.engage, notice=0.0)
             node.enable_master_gravity()
         if args.engage:
             if not node.prealign(node.master_joints):
