@@ -143,12 +143,17 @@ class MasterBridge(Node):
 
         # 数采: 主臂手柄sw1短按 开/停一个episode
         self.rec_buf = None        # episode缓冲(录制中在内存累积原始流)
+        self.rec_pending = None    # 已结束待确认的episode (buf, ep, dur); sw4保存/sw1丢弃
         self._rec_write_lock = threading.Lock()   # LeRobot写入串行化
         self.rec_dir = None          # 当前episode目录
         self.rec_t0 = None
         self.rec_ep = 0
         self._sw1_prev = False
         self._last_sw1_ts = 0.0
+        self._sw3_prev = False
+        self._last_sw3_ts = 0.0
+        self._sw4_prev = False
+        self._last_sw4_ts = 0.0
         self._sw2_prev = False
         self._home_busy = False       # 运行中主臂回零进行中(防重入/防开录)
         self._scan_episodes()
@@ -232,20 +237,22 @@ class MasterBridge(Node):
 
     # ---------- 主臂关节归零(位置伺服回零后交回重力补偿) ----------
     def _udp_latest_mj(self, wait=0.5):
-        """从UDP流取最新一帧主臂关节角(归零到位反馈), 无则None"""
-        pos, t0 = None, time.time()
-        while time.time() - t0 < wait:
+        """从UDP流取主臂关节角: 先等首帧(wait秒内), 再把缓冲排干取最新一帧;
+        wait=0为纯非阻塞(无帧立即返回None)"""
+        pos, deadline = None, time.time() + wait
+        while True:
             try:
                 data, _ = self.udp.recvfrom(2048)
             except BlockingIOError:
-                time.sleep(0.01)
+                if pos is not None or time.time() >= deadline:
+                    return pos
+                time.sleep(0.005)
                 continue
             if data.startswith(b"MJ "):
                 try:
                     pos = [float(v) for v in data[3:].split()]
                 except ValueError:
                     pass
-        return pos
 
     def hold_slave(self, dur=2.0):
         """激活从臂控制器后立即以rate频率发布当前关节角:
@@ -303,7 +310,9 @@ class MasterBridge(Node):
             self.log(f"★ {who}开始限速缓动回零, 请勿手持主臂, "
                      f"确保主从臂周围无人!", "INFO")
         try:
-            ws = _ws.create_connection(self.args.master, timeout=5)
+            ws = _ws.create_connection(
+                self.args.master, timeout=5,
+                sockopt=((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),))
         except Exception as e:
             self.log_error(f"主臂归零: rosbridge连接失败({e}), 跳过")
             return False
@@ -346,6 +355,8 @@ class MasterBridge(Node):
             self.log(f"{who}回零: {msg}, 限速{vmax:.2f}rad/s, "
                      f"预计{dur:.1f}s")
             t0, err_m, err_s = time.time(), None, None
+            period = 1.0 / 50.0   # 50Hz匀速指令流(低频/不匀节拍下发会卡顿)
+            next_t = time.perf_counter()
             while time.time() - t0 < dur + timeout:
                 el = time.time() - t0
                 s = max(0.0, 1.0 - el / dur) if dur > 0 else 0.0
@@ -358,7 +369,7 @@ class MasterBridge(Node):
                         self.clamp_step([v * s for v in q0]))
                     if self.slave_joints is not None:
                         err_s = max(abs(v) for v in self.slave_joints)
-                cur = self._udp_latest_mj(0.05)
+                cur = self._udp_latest_mj(0.0)   # 非阻塞取一帧到位反馈
                 if cur is not None and len(cur) == 6:
                     err_m = max(abs(v) for v in cur)
                 done = (s <= 0.0 and err_m is not None and err_m < tol and
@@ -366,7 +377,12 @@ class MasterBridge(Node):
                          (err_s is not None and err_s < tol)))
                 if done:
                     break
-                time.sleep(0.05)
+                next_t += period
+                dt = next_t - time.perf_counter()
+                if dt > 0:
+                    time.sleep(dt)
+                else:               # 本轮已超期, 重置节拍防累计漂移
+                    next_t = time.perf_counter()
             try:
                 ws.send(json.dumps({"op": "unadvertise", "topic": topic}))
             except Exception:
@@ -476,15 +492,27 @@ class MasterBridge(Node):
             return
         v = float(v)                  # 保留原始值用于标定
         self.trig_value = v
-        # sw1上升沿(短按)切换数采录制开/停
+        # 数采按键(上升沿短按): sw1开录/丢弃重录, sw3结束本集, sw4确认保存
         if not self.args.no_rec:
-            sw1 = bool(m.get("sw1", False))
             now_pc = time.perf_counter()
+            sw1 = bool(m.get("sw1", False))
             if sw1 and not self._sw1_prev and \
                     now_pc - self._last_sw1_ts > 0.5:
                 self._last_sw1_ts = now_pc
                 self.rec_toggle()
             self._sw1_prev = sw1
+            sw3 = bool(m.get("sw3", False))
+            if sw3 and not self._sw3_prev and \
+                    now_pc - self._last_sw3_ts > 0.5:
+                self._last_sw3_ts = now_pc
+                self.rec_stop()
+            self._sw3_prev = sw3
+            sw4 = bool(m.get("sw4", False))
+            if sw4 and not self._sw4_prev and \
+                    now_pc - self._last_sw4_ts > 0.5:
+                self._last_sw4_ts = now_pc
+                self.rec_save()
+            self._sw4_prev = sw4
         # sw2上升沿(短按): 运行中主臂限速回零(后台线程, 从臂由跟随自动带零)
         sw2 = bool(m.get("sw2", False))
         if sw2 and not self._sw2_prev:
@@ -761,12 +789,18 @@ class MasterBridge(Node):
         return bad
 
     def rec_toggle(self):
+        """sw1: 开录(空闲时); 若有未保存的上一集=丢弃重录; 录制中无效(结束用sw3)"""
         if self._recording():
-            self.rec_stop()
+            self.log_throttle("录制进行中, 结束本集请按sw3", 1.0, "WARN")
             return
         if self._home_busy:
             self.log("✗ 主臂回零进行中, 稍后再开录", "REC✗")
             return
+        if self.rec_pending is not None:
+            _, ep, dur = self.rec_pending
+            self.rec_pending = None
+            self.log(f"✗ 丢弃未保存的episode_{ep:04d}({dur:.1f}s), 重录新集"
+                     f"(想保留上一集请先按sw4)", "REC✗")
         # 开录前格式预检: 不符立即拒绝, 避免录完整集才在写入时报错白录
         info = os.path.join(self.rec_ds_root(), "meta", "info.json")
         if os.path.exists(info):
@@ -783,6 +817,7 @@ class MasterBridge(Node):
                  f"{self.rec_ds_root()} 任务: {self.args.task}", "REC▶")
 
     def rec_stop(self, sync=False):
+        """sw3: 结束本集 -> 数据挂起待保存(sw4确认写入 / sw1丢弃重录)"""
         if self.rec_buf is None:
             return
         buf, ep = self.rec_buf, self.rec_ep
@@ -793,9 +828,37 @@ class MasterBridge(Node):
             self.log(f"✗ episode_{ep:04d} 时长{dur:.1f}s过短, 已丢弃"
                      f"(需>{self.args.trim * 2 + 0.6:.1f}s才成集)", "REC✗")
             return
-        self.log(f"■ episode_{ep:04d} 录制结束({dur:.1f}s), "
-                 f"正在写入LeRobot...", "REC…")
+        if sync:   # 内部/退出路径: 不挂起, 直接写
+            self.log(f"■ episode_{ep:04d} 录制结束({dur:.1f}s), 同步写入...", "REC…")
+            self._write_episode(buf, ep, sync=True)
+            return
+        self.rec_pending = (buf, ep, dur)
+        self.log(f"■ episode_{ep:04d} 录制结束({dur:.1f}s), 待保存: "
+                 f"sw4=写入数据集 / sw1=丢弃重录", "REC…")
 
+    def rec_save(self):
+        """sw4: 确认保存挂起的episode(后台写入)"""
+        if self.rec_pending is None:
+            self.log_throttle("无待保存数据(流程: sw1开录 -> sw3结束 -> sw4保存)",
+                              1.0, "WARN")
+            return
+        buf, ep, dur = self.rec_pending
+        self.rec_pending = None
+        self.log(f"■ episode_{ep:04d}({dur:.1f}s) 确认保存, 正在写入LeRobot...",
+                 "REC…")
+        self._write_episode(buf, ep)
+
+    def flush_pending(self):
+        """退出路径: 自动保存挂起未确认的episode(避免Ctrl+C丢掉最后一条)"""
+        if self.rec_pending is None:
+            return
+        buf, ep, dur = self.rec_pending
+        self.rec_pending = None
+        self.log(f"■ 退出前自动保存未确认的episode_{ep:04d}({dur:.1f}s)...",
+                 "REC…")
+        self._write_episode(buf, ep, sync=True)
+
+    def _write_episode(self, buf, ep, sync=False):
         def _write():
             # 写入串行化: 上一集还在编码时, 本集排队等待, 避免并发写坏数据集
             with self._rec_write_lock:
@@ -828,6 +891,8 @@ class MasterBridge(Node):
     def rec_str(self):
         if self._recording():
             return f"REC:ep{self.rec_ep:04d}"
+        if self.rec_pending is not None:
+            return f"REC:待存{self.rec_pending[1]:04d}"
         return "REC:-"
 
     def trigger_str(self):
@@ -1005,10 +1070,11 @@ def main():
         pass
     finally:
         log_line("退出中: 等待在途数据写入完成(视频编码可能需数十秒)...")
-        node.wait_rec_writes()
+        node.flush_pending()          # 挂起未确认的集自动保存, 防丢最后一条
         if activated:
             node.soft_stop()
-        node.rec_stop(sync=True)   # 若在录制中, 同步写完最后一集再退出
+        node.rec_stop(sync=True)      # 若仍在录制中, 同步写完再退出
+        node.wait_rec_writes()
         rx_proc.terminate()
         try:
             node.destroy_node()
