@@ -47,7 +47,7 @@ def quat_to_6d(x, y, z, w):
 
 def task_dirname(task):
     """任务文本 -> 数据集子目录名(非法字符与空白转下划线, 截断80字符)"""
-    name = re.sub(r"[^\w\-.]+", "_", task.strip())
+    name = re.sub(r"[^\w-]+", "_", task.strip())
     return name.strip("_")[:80] or "task"
 
 
