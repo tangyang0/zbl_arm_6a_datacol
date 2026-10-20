@@ -56,6 +56,26 @@ ros2 launch zbl_arm_6a_description test_single_arm.launch.py can_interface:=can4
 ```
 主臂PC开机即可,无需在其WebUI上做任何操作(它常驻发布关节流)。
 
+### 1.0 启动自检: 控制器状态(SDK冷启动约30s后执行)
+
+```bash
+ros2 control list_controllers
+```
+
+**正常待机状态**(三项active, 三项inactive):
+```
+gripper_controller             x2robot_controllers/JointImpedanceController     active
+joint_state_broadcaster        joint_state_broadcaster/JointStateBroadcaster    active
+endpose_broadcaster            x2robot_controllers/EndposeBroadcaster           active
+cart_pose_controller           x2robot_controllers/QPIKController               inactive
+joint_position_controller      x2robot_controllers/JointImpedanceController     inactive
+zero_force_dragging_controller x2robot_controllers/GravityCompensateController  inactive
+```
+
+异常处理: gripper_controller 非 active **或夹爪发软**(显示active但伺服未使能,
+SDK被强杀后重启常见) → 按第5节方法重置; 遥操启动后 joint_position_controller
+会变 active 属正常, 退出软急停后回到上表状态。
+
 ### 1.1 停止/重启 SDK 进程(机械臂断电重上电后, 不用重启容器)
 
 在当初运行 `&` 的那个终端里:
@@ -160,6 +180,11 @@ ros2 control switch_controllers --deactivate joint_position_controller cart_pose
 ## 5. 注意事项
 
 - 主臂数据流中断>0.5s自动悬停, 恢复后限速追平; Ctrl+C 自动软急停。
+- **夹爪发软/不响应指令** = gripper伺服掉线(SDK进程被强杀后重启时常见,
+  控制器显示active但未真正使能)。处理: `ros2 control switch_controllers
+  --deactivate gripper_controller && ros2 control switch_controllers
+  --activate gripper_controller`, 无效则重启SDK栈; master_bridge与replay
+  启动时已自动重置夹爪控制器。
 - 同一从臂只允许一个控制源(勿同时跑示例代码/其他控制节点)。
 - WiFi 抖动(本机↔主臂PC ping 3~100ms)导致跟手卡顿的话, 两台机器接有线。
 - 主臂若与从臂镜像摆放, 需在 clamp_step 前加符号映射。
@@ -198,6 +223,16 @@ python3 master_bridge.py --engage --task "pick up test tube No. 1 from the left 
 #   ~/workspace/zbl_arm_6a_datacol/data/zbl_data/<任务名>/
 #   每个任务名目录是一个独立完整的LeRobot数据集(同任务自动增量追加)
 #   训练时 repo_id 指到任务目录 -> wall-x compute_norm_stats.py -> 训练
+```
+
+**回放验证(数据质检, 与遥操互斥勿同时跑)**:
+```bash
+python3 replay.py --list                       # 列出仓库内全部数据集
+python3 replay.py data/zbl_data/<任务目录>      # 干跑: 打印episode摘要
+python3 replay.py data/zbl_data/<任务目录> --engage            # 真机回放最新一集
+python3 replay.py data/zbl_data/<任务目录> --episode 0 --speed 0.5 --engage
+# 回放的是observation.joints=录制时从臂真实轨迹; 开始/结束自动限速缓动回零
+# (--no-home-start/--no-home-end跳过), 自带预对齐/限幅/软急停
 ```
 
 录制相关参数:

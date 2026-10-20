@@ -662,6 +662,20 @@ class MasterBridge(Node):
             self.rec_buf.aj.append(list(q))
             self.rec_buf.aj_ts.append(time.perf_counter())
 
+    def bounce_gripper(self):
+        """夹爪控制器去激活再激活, 强制其重新使能伺服。
+        SDK进程被强杀(docker rm -f / kill -9)后重启时, gripper_controller可能
+        显示active但伺服实际未使能(夹爪变软、指令无响应), 重置即恢复。
+        防止带着死夹爪录制整批数据。"""
+        ok1 = self.switch_controllers([], ["gripper_controller"])
+        time.sleep(0.5)
+        ok2 = self.switch_controllers(["gripper_controller"], [])
+        if ok1 and ok2:
+            self.log("夹爪控制器已重置(强制重新使能伺服)")
+        else:
+            self.log_error("夹爪控制器重置失败, 若夹爪发软请重启SDK栈")
+        return ok1 and ok2
+
     def wait_master(self, timeout=10.0):
         self.log("等待主臂数据流...")
         t0 = time.time()
@@ -1052,6 +1066,7 @@ def main():
                                             "zero_force_dragging_controller"]):
                 raise SystemExit("切换到关节位置模式失败")
             activated = True
+            node.bounce_gripper()   # 防夹爪伺服掉线(强杀SDK后常见)
             node.hold_slave(2.0)   # 激活后立即保持当前位姿, 消除旧目标窜动
         if not args.no_gravity_comp:
             if not args.no_master_zero:
