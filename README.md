@@ -214,13 +214,14 @@ docker push ghcr.io/tangyang0/zbl_arm_6a_datacol:v0.2.0
 
 ```bash
 # 容器内启动遥操, --task 用自然语言任务指令(VLA微调任务标签):
-python3 master_bridge.py --engage --task "pick up test tube No. 1 from the left rack and place it in the right rack"
+python3 master_bridge.py --engage --dataset zbl_data_v2 --gripper-max 1.70 \
+  --task "pick up test tube No. 1 from the left rack and place it in the right rack"
 # 遥操中每集三键流程: sw1=开录 -> sw3=结束本集(挂起待存) -> sw4=确认写入
 #   - 不按sw4直接再按sw1 = 丢弃上一集, 直接重录
 #   - Ctrl+C退出时: 录制中的集同步写完, 挂起未确认的集自动保存
 #   - sw4写入在后台进行(视频编码需数秒), 不影响继续遥操
 # 数据直接落在仓库 data/ 目录(仓库整体挂载, 宿主机即时可见, 不需拷贝):
-#   ~/workspace/zbl_arm_6a_datacol/data/zbl_data/<任务名>/
+#   ~/workspace/zbl_arm_6a_datacol/data/zbl_data_v2/<任务名>/
 #   每个任务名目录是一个独立完整的LeRobot数据集(同任务自动增量追加)
 #   训练时 repo_id 指到任务目录 -> wall-x compute_norm_stats.py -> 训练
 ```
@@ -229,8 +230,8 @@ python3 master_bridge.py --engage --task "pick up test tube No. 1 from the left 
 ```bash
 python3 replay.py --list                       # 列出仓库内全部数据集
 python3 replay.py data/zbl_data/<任务目录>      # 干跑: 打印episode摘要
-python3 replay.py data/zbl_data/<任务目录> --engage            # 真机回放最新一集
-python3 replay.py data/zbl_data/<任务目录> --episode 0 --speed 0.5 --engage
+python3 replay.py data/zbl_data_v2/<任务目录> --engage         # 新数据从meta读取夹爪比例
+python3 replay.py data/zbl_data/<任务目录> --episode 0 --speed 0.5 --grip-max <当时实际采集上限rad> --engage
 # 回放的是observation.joints=录制时从臂真实轨迹; 开始/结束自动限速缓动回零
 # (--no-home-start/--no-home-end跳过), 自带预对齐/限幅/软急停
 ```
@@ -241,14 +242,111 @@ python3 replay.py data/zbl_data/<任务目录> --episode 0 --speed 0.5 --engage
   每个任务目录=独立数据集, 同任务增量追加)
 - `--action-mode ee|joints`  ee(默认)=末端xyz+6D姿态+夹爪10维;
   joints=6关节+夹爪7维
-- `--fps 20` 目标帧率(与模型预训练一致; 相机/关节/位姿各流最近邻对齐重采样)
+- `--fps 20` 目标整数帧率；相机/关节/位姿各流最近邻重采样，执行端应保持对应时间尺度
 - `--trim 0.5` 每集掐头去尾秒数(0关闭)
 - 注意: 同一数据集内图像流需一致(中途开/关过相机就换个 `--dataset` 分组名)
 
-数据集内容: observation.state(10=末端xyz+6D姿态+夹爪, 与预训练agent_pos同构),
+### 7.1 新采集记录与旧数据兼容
+
+新版增加 `acq.*` 诊断列，模型使用的 `observation.state/action` 仍为原来的
+10 维，`observation.joints` 仍为 7 维。**已有旧 schema 的数据集会在开录前拒绝
+追加**，请使用新分组名（例如 `--dataset zbl_data_v2`）；程序不会回填或改写旧
+50 条轨迹、旧 `norm_stats.json` 和 checkpoint。
+
+夹爪数据是实测 `arm_gripper / --gripper-max` 后的 `[0,1]` 比例。命令中的
+1.70 rad 是本次采集选择的行程上限示例，不代表硬件统一物理满开值；应核验后设置。
+同一数据集的上限、动作模式、帧率、时钟模式和标定编号必须一致。新数据会保存实际
+参数，`replay.py` 自动读取；旧数据真机回放必须显式提供已核实的 `--grip-max`。
+回放按 LeRobot v3 的 episode metadata 查找文件，支持同一个 Parquet 包含多个
+episode，额外的 `acq.*` 列不会改变回放轨迹。
+回放在任何 ROS 导入及控制器操作前检查 `speed/vmax/align-vmax/fps` 为有限正数，
+并检查关节轨迹非空、形状为 `[N,7]`、全部有限，六关节在脚本既定 SDK 限位内、
+夹爪比例在 `[0,1]` 内；不合格时直接退出。
+
+每个任务目录保持 LeRobot 结构：
+
+```text
+<task>/
+├── data/                         # state/action/joints及acq.*数值列
+├── videos/                       # 编码后的相机视频
+├── meta/
+│   ├── info.json、stats.json     # 由LeRobot管理
+│   ├── episodes/、tasks.parquet  # 由LeRobot管理
+│   └── acquisition/              # 本项目扩展，不是LeRobot标准必填字段
+│       ├── dataset_contract.json
+│       └── episode_000000.json
+└── images/                       # 仅编码临时PNG，成功后删除空父目录
+```
+
+仅当 `save_episode()` 和 `finalize()` 都成功，才用 `rmdir` 清理空的相机父目录及
+最外层 `images/`。非空缓存、符号链接和编码失败的 PNG 不会递归删除。写入期间保留
+`.pending.json`，完整保存后转为正式 episode JSON；若存在未完成记录，会拒绝追加，
+应先检查部分写入内容，不能直接删除缓存后当作成功。
+数据集目录自身是符号链接时也不清理。后台 writer 在启动或排队前登记未完成计数，
+退出等待以一次总超时覆盖全部已登记 writer，避免“线程已启动、尚未抢到写锁”时提前退出。
+
+`acq.*` 逐帧记录原始 header 纳秒、主机接收 monotonic 纳秒、源样本序号、匹配误差、
+匹配帧龄、相邻源帧间隔及有效标记。`acq.action_pose.*` 和 `acq.action_joints.*`
+分别追溯下一采样时刻的动作目标，包含最后一条 action 对应的未保存观测。整数时间
+以 `int64` 保存，不混入 10 维模型输入，也不生成训练归一化统计。
+
+episode JSON 保存实际 CLI、源码 SHA/dirty 状态及源码文件 hash、topic/frame_id、
+单位、夹爪上限、时钟域、质量摘要和 `--calibration-id`。标定 ID 仅引用外部核验记录；
+采集程序不自动验证物理坐标轴/工具零姿态，也不应用额外坐标变换。
+
+### 7.2 同步检查
+
+默认 `--sync-clock receive` 使用同一主机的接收 monotonic 时钟，原始消息 header
+另行保留。**接收时间接近不等于曝光时刻和机械臂采样时刻一致**；不同 clock domain
+的原始时间不能直接相减。程序取所有必需流的时间覆盖交集后，再掐头去尾并构造固定
+网格。
+
+以下阈值是可配置的初值，尚不是这套实物系统测量得到的最优参数：
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--sync-max-match-ms` | 50 | 选中源时间与网格时间的最大绝对差 |
+| `--sync-max-age-ms` | 100 | 网格相对较旧源样本的最大年龄，不是网络传输延迟 |
+| `--sync-max-gap-ms` | 250 | 网格处相邻源样本的最大间隔 |
+| `--sync-max-clock-skew-ms` | 100 | header模式各流header→receive中位偏移的最大差 |
+
+任何网格不合格、必需流断流、正的 header 重复/倒退、episode 内 frame_id 改变、
+图像尺寸改变或非法数值都会拒绝整条 episode 写入训练集；**不会删掉坏帧再压缩成
+看似规则的20Hz序列**。失败会显示诊断并保留当前进程内的 buffer，可按 sw4 重试
+或 sw1 明确丢弃；内存 buffer 不会跨进程退出保留。已发生部分文件写入时，还需先
+检查 `.pending.json`，不能自动重试覆盖。
+
+只有确认各源 header 使用同一时钟域后，才使用：
+
+```bash
+--sync-clock header --header-clock-domain <已核验的共同源时钟域>
+```
+
+该模式要求所有 header 有效且递增，并检查各流相对接收时钟偏移的合理一致性；
+它仍不代替曝光、驱动延迟和物理同步实验。缺少相机默认拒绝写入；仅非当前 VLA
+用途可显式使用 `--allow-no-camera`。
+
+### 7.3 统计兼容与验证
+
+本项目的 `lerobot_stats.py` 适配器固定针对 **LeRobot 0.4.4**：只在受锁保护的
+单次保存期间替换统计回调，在 `finally` 恢复，不修改 site-packages 文件。
+图像先转 `float64` 再计算平方和，避免 `uint8` 溢出造成 std=0；跳过 `acq.*`
+诊断统计，避免绝对纳秒整数溢出和误入归一化。其他版本先验证 API 再使用，开录
+前会检查版本。不要在同一进程中并发运行其他未经过该锁的 LeRobot writer。
+
+不连接 ROS/机械臂的 CPU 回归：
+
+```bash
+python -m unittest discover -s tests -v
+# 使用已安装的lerobot==0.4.4在临时目录写入/追加/回读toy数据，含模拟编码失败：
+CUDA_VISIBLE_DEVICES="" RUN_LEROBOT_INTEGRATION=1 \
+  python -m unittest discover -s tests -v
+```
+
+数据集内容: observation.state(10=末端xyz+6D姿态+夹爪),
 observation.joints(7=6关节+夹爪归一化, 备用), action(10=从臂末端绝对位姿,
 与state同一条从臂流错开一帧, action[i]≡state[i+1], 官方x2robot2lerobot同语义;
 训练侧loader自动转delta; joints模式为7), observation.images.wrist(相机视频),
 任务标签来自--task自然语言指令。
-训练侧: 把 `data/zbl_data/<任务名>/` 整个目录拷到训练机, 用wall-x的
-scripts/compute_norm_stats.py算归一化统计后即可训练。
+训练侧: 把 `data/zbl_data_v2/<任务名>/` 整个目录拷到训练机，先固定完整episode
+划分，再只用训练episodes及episode内合法动作窗口计算归一化统计。

@@ -2,7 +2,8 @@
 """数据集episode回放到从臂 —— 数据质检用(眼见为实)
 
 回放内容: observation.joints(6关节+夹爪开度0~1) = 录制时从臂的真实轨迹,
-夹爪按 开度x--grip-max(1.70rad) 下发。默认干跑只打印摘要, --engage 才真动臂。
+夹爪按保存的采集上限还原；旧数据缺元数据时，真机回放须显式--grip-max。
+默认干跑只打印摘要, --engage 才真动臂。
 
 用法(容器内, SDK已launch, 与遥操互斥勿同时跑):
   python3 replay.py --list                                # 列出仓库内全部数据集
@@ -14,7 +15,10 @@
 (逐帧限幅vmax) -> 结束保持1s后软急停; Ctrl+C随时软急停。
 """
 import argparse
+import json
+import math
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -28,18 +32,79 @@ JOINT_NAMES = [f"arm_joint{i}" for i in range(1, 7)]
 
 
 def load_episode(ds_dir, ep_idx):
-    import json
-    info = json.load(open(os.path.join(ds_dir, "meta", "info.json")))
+    root = Path(ds_dir)
+    info = json.loads((root / "meta/info.json").read_text())
     n_total = int(info.get("total_episodes", 0))
     if ep_idx is None:
         ep_idx = n_total - 1          # 默认最新一集
     if not 0 <= ep_idx < n_total:
         raise SystemExit(f"episode序号{ep_idx}超出范围(共{n_total}集: 0~{n_total-1})")
-    pq = os.path.join(ds_dir, "data", "chunk-000", f"file-{ep_idx:03d}.parquet")
-    if not os.path.exists(pq):
-        raise SystemExit(f"找不到 {pq}")
+    # LeRobot v3 can put multiple episodes into one data shard. Resolve the
+    # shard through episode metadata, never assume file-N == episode N.
+    episode = None
+    for file in sorted((root / "meta/episodes").rglob("*.parquet")):
+        table = pd.read_parquet(file, columns=[
+            "episode_index", "data/chunk_index", "data/file_index"])
+        selected = table[table["episode_index"] == ep_idx]
+        if len(selected):
+            if episode is not None or len(selected) != 1:
+                raise SystemExit(f"episode {ep_idx} metadata重复")
+            episode = selected.iloc[0]
+    if episode is None:
+        raise SystemExit(f"找不到episode {ep_idx}的LeRobot v3 metadata")
+    relative = info["data_path"].format(
+        chunk_index=int(episode["data/chunk_index"]), file_index=int(episode["data/file_index"]))
+    pq = root / relative
     df = pd.read_parquet(pq)
+    df = df[df["episode_index"] == ep_idx].sort_values("frame_index").reset_index(drop=True)
+    if len(df) == 0 or list(df["frame_index"]) != list(range(len(df))):
+        raise SystemExit(f"episode {ep_idx}帧索引为空或不连续")
     return ep_idx, df, float(info.get("fps", 20))
+
+
+def resolve_gripper_scale(ds_dir, ep_idx, explicit=None, require=False):
+    metadata = Path(ds_dir) / f"meta/acquisition/episode_{ep_idx:06d}.json"
+    saved = None
+    if metadata.is_file():
+        saved = float(json.loads(metadata.read_text())["contract"]["gripper_max_rad"])
+    if explicit is not None and (not math.isfinite(explicit) or explicit <= 0):
+        raise SystemExit("--grip-max必须为已确认的有限正数")
+    if saved is not None and (not math.isfinite(saved) or saved <= 0):
+        raise SystemExit("保存的gripper_max_rad无效")
+    if saved is not None and explicit is not None and not math.isclose(saved, explicit):
+        raise SystemExit("--grip-max与本episode采集上限不同，不能静默改变回放比例")
+    scale = saved if saved is not None else explicit
+    if require and scale is None:
+        raise SystemExit("旧episode未保存夹爪上限；核实后显式传--grip-max，尚未连接真机")
+    return scale
+
+
+def validate_replay_settings(speed, vmax, align_vmax, fps=None):
+    """Run before any ROS import or controller action."""
+    settings = {"speed": speed, "vmax": vmax, "align_vmax": align_vmax}
+    if fps is not None:
+        settings["fps"] = fps
+    for name, value in settings.items():
+        if not math.isfinite(value) or value <= 0:
+            raise SystemExit(f"{name}必须是有限正数，尚未连接真机")
+
+
+def validate_replay_data(joints, fps, speed, vmax, align_vmax):
+    validate_replay_settings(speed, vmax, align_vmax, fps)
+    try:
+        values = np.asarray(joints, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("observation.joints必须为非空[N,7]数值数组，尚未连接真机") from exc
+    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] != 7:
+        raise SystemExit("observation.joints必须为非空[N,7]数组，尚未连接真机")
+    if not np.isfinite(values).all():
+        raise SystemExit("observation.joints含NaN或Inf，尚未连接真机")
+    # Use the existing SDK joint bounds and recorded gripper-fraction contract.
+    if np.any(values[:, :6] < SLAVE_LOWER) or np.any(values[:, :6] > SLAVE_UPPER):
+        raise SystemExit("录制关节超出本脚本既定SDK限位，尚未连接真机")
+    if np.any(values[:, 6] < 0) or np.any(values[:, 6] > 1):
+        raise SystemExit("录制夹爪比例超出[0,1]，尚未连接真机")
+    return values
 
 
 def cmd_list(root):
@@ -70,7 +135,8 @@ def main():
     p.add_argument('--episode', type=int, default=None, help='episode序号(默认最新一集)')
     p.add_argument('--speed', type=float, default=1.0, help='回放倍速(默认1.0, 建议0.5慢放)')
     p.add_argument('--vmax', type=float, default=3.0, help='逐帧限幅rad/s(默认3.0)')
-    p.add_argument('--grip-max', type=float, default=1.70, help='夹爪满开rad(默认1.70)')
+    p.add_argument('--grip-max', type=float, default=None,
+        help='已核实的采集夹爪上限rad；新数据自动读meta，旧数据真机回放必填')
     p.add_argument('--align-vmax', type=float, default=0.3, help='缓动限速rad/s(回零/预对齐)')
     p.add_argument('--no-home-start', action='store_true', help='跳过开始时回零')
     p.add_argument('--no-home-end', action='store_true', help='跳过结束时回零')
@@ -85,8 +151,14 @@ def main():
         return
     if not args.dataset:
         p.error("请给数据集目录, 或用 --list")
+    validate_replay_settings(args.speed, args.vmax, args.align_vmax)
     ep_idx, df, fps = load_episode(args.dataset, args.episode)
-    j = np.stack(df['observation.joints'].values)          # (N,7) 关节+夹爪开度
+    args.grip_max = resolve_gripper_scale(
+        args.dataset, ep_idx, args.grip_max, require=args.engage)
+    if "observation.joints" not in df:
+        raise SystemExit("缺少observation.joints，尚未连接真机")
+    j = validate_replay_data(
+        df["observation.joints"].tolist(), fps, args.speed, args.vmax, args.align_vmax)
     n = len(j)
     print(f"episode_{ep_idx:03d}: {n}帧 @ {fps:.0f}fps = {n / fps:.1f}s, "
           f"倍速{args.speed} -> 实际{n / fps / args.speed:.1f}s")

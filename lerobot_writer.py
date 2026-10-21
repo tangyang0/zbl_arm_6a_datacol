@@ -1,42 +1,29 @@
 #!/usr/bin/env python3
-"""录制时直接写LeRobot v3数据集(wall-x训练格式), SDK容器内由master_bridge调用
-
-数据流: bridge把各路原始流(统一perf_counter时间戳)喂进EpisodeBuffer,
-episode结束时 write_episode(): 以相机时间戳为主轴(无相机按fps重采样)
--> 掐头去尾 -> 最近邻对齐 -> 第i帧行动=第i+1帧 -> 追加写入数据集+编码视频。
-对齐与映射逻辑与 h5_to_lerobot.py 保持同源一致。
-"""
+"""LeRobot v3 capture with bounded alignment and per-frame acquisition columns."""
+from datetime import datetime, timezone
+import errno
+import json
 import math
 import os
+from pathlib import Path
 import re
 import subprocess
+import warnings
 
 import numpy as np
 
-
-class EpisodeBuffer:
-    """一个episode的原始流缓冲(生产者: 桥接回调; 消费者: write_episode)"""
-
-    def __init__(self):
-        self.state, self.state_ts = [], []       # (7,) 6关节+夹爪(rad)
-        self.aj, self.aj_ts = [], []             # (6,) 关节指令
-        self.ag, self.ag_ts = [], []             # (1,) 夹爪指令
-        self.pose, self.pose_ts = [], []         # (7,) 末端xyz+quat
-        self.imgs, self.img_ts = [], []          # jpg原始字节
-
-    def has_data(self):
-        return len(self.state_ts) > 10
-
-
-def nearest_indices(src_ts, dst_ts):
-    idx = np.searchsorted(src_ts, dst_ts)
-    idx = np.clip(idx, 1, len(src_ts) - 1)
-    left = src_ts[idx - 1]
-    right = src_ts[idx]
-    return np.where(dst_ts - left <= right - dst_ts, idx - 1, idx)
+from acquisition import (
+    ACQUISITION_SCHEMA_VERSION, AlignmentConfig, AlignmentError, EpisodeBuffer,
+    align_episode, diagnostic_features, nearest_indices, schema_errors, write_json_atomic,
+)
+from lerobot_stats import safe_lerobot_statistics
 
 
 def quat_to_6d(x, y, z, w):
+    norm = math.sqrt(x*x + y*y + z*z + w*w)
+    if not math.isfinite(norm) or norm < 1e-8:
+        raise ValueError("invalid end-pose quaternion")
+    x, y, z, w = x/norm, y/norm, z/norm, w/norm
     R = np.array([
         [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
@@ -51,52 +38,115 @@ def task_dirname(task):
     return name.strip("_")[:80] or "task"
 
 
+def acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id=""):
+    return {
+        "schema_version": ACQUISITION_SCHEMA_VERSION, "fps": int(fps),
+        "action_mode": action_mode, "gripper_max_rad": float(grip_max),
+        "alignment_clock": alignment.clock,
+        "header_clock_domain": alignment.header_clock_domain,
+        "require_camera": alignment.require_camera,
+        "calibration_id": calibration_id,
+    }
+
+
+def dataset_compatibility_errors(ds_dir, fps, action_mode, grip_max, alignment,
+                                 calibration_id=""):
+    """Read-only preflight, also called before recording starts."""
+    ds_dir = Path(ds_dir)
+    info_path = ds_dir / "meta/info.json"
+    if not info_path.exists():
+        if ds_dir.exists() and any(ds_dir.iterdir()):
+            return ["目标目录存在但缺少有效meta/info.json；请检查上次写入或换--dataset"]
+        return []
+    try:
+        info = json.loads(info_path.read_text())
+        errors = schema_errors(info, fps, action_mode, alignment.require_camera)
+        contract_path = ds_dir / "meta/acquisition/dataset_contract.json"
+        if not contract_path.is_file():
+            errors.append("缺少新版采集契约；旧数据请保留并换一个--dataset名称")
+        else:
+            actual = json.loads(contract_path.read_text())
+            expected = acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id)
+            if actual != expected:
+                errors.append(f"采集契约变化：已保存{actual}，当前{expected}；请换--dataset")
+        if any((ds_dir / "meta/acquisition").glob("episode_*.pending.json")):
+            errors.append("发现未完成的写入记录(.pending.json)，请检查数据后再追加")
+        return errors
+    except (OSError, ValueError, TypeError) as exc:
+        return [f"无法验证数据集schema/采集契约: {exc}"]
+
+
+def cleanup_empty_images(ds_dir, camera_keys=("observation.images.wrist",)):
+    """Only remove empty parent directories after a completed episode save."""
+    ds_dir = Path(ds_dir)
+    if ds_dir.is_symlink():
+        return []
+    images = ds_dir / "images"
+    removed = []
+    if images.is_symlink():
+        return removed
+    for directory in [*(images / key for key in camera_keys), images]:
+        if directory.is_symlink():
+            continue
+        try:
+            directory.rmdir()
+            removed.append(str(directory))
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
+                warnings.warn(f"保留images目录，无法清理空目录{directory}: {exc}")
+    return removed
+
+
 def write_episode(buf, root, task, action_mode="ee", fps=20,
-                  trim=0.5, grip_max=1.70):
-    """把buffer写为数据集的一个episode(自动新建或追加), 返回帧数
+                  trim=0.5, grip_max=1.70, alignment=None, calibration_id=""):
+    """Save a new-schema episode; refuse unsafe alignment or legacy-schema append.
 
-    目录层级: <root>/<任务名>/ 为一个独立完整的LeRobot v3数据集
-    (同一任务增量追加; 换任务自动另起目录), 落盘后全目录开放读写权限
-    (容器uid与本机用户不同, 不chmod会在本机文件管理器里显示锁)。
-
-    时间轴: 统一重采样到目标fps网格(与模型预训练帧率对齐, 默认20Hz),
-    各路原始流(200Hz关节/位姿, 相机原生帧率)最近邻对齐到网格。
-    状态: observation.state = 末端10维[x,y,z,rot6d,grip]
-          (与wall-x预训练agent_pos同构: pos3+rotation_6D+gripper),
-          observation.joints = 7维[6关节角+夹爪归一化](备用)。
-    动作: 与状态同源(同一条从臂流, 官方x2robot2lerobot语义),
-    第i帧行动=第i+1帧实测位姿, 即 action[i] ≡ state[i+1](末帧丢弃);
-    ee模式为绝对末端位姿(训练侧loader自动转delta, 与预训练relative布局对齐)。
+    State/action semantics stay unchanged: absolute measured EE xyz+rotation6D+
+    gripper fraction; action[i] is the next resampled measurement. acq.* values
+    are diagnostics, never appended to the model's 10-D vectors.
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    state = np.array(buf.state)
-    state_ts = np.array(buf.state_ts)
-    pose = np.array(buf.pose) if buf.pose else None
-    if pose is None:
-        raise ValueError("缺少end_pose数据(末端状态必需)")
-    pose_ts = np.array(buf.pose_ts)
+    alignment = alignment or AlignmentConfig()
+    alignment.validate()
+    if action_mode not in ("ee", "joints"):
+        raise ValueError("action_mode must be ee or joints")
+    if not math.isfinite(grip_max) or grip_max <= 0:
+        raise ValueError("grip_max must be positive and finite")
+    tdir = task_dirname(task)
+    ds_dir = Path(root) / tdir
+    errors = dataset_compatibility_errors(
+        ds_dir, fps, action_mode, grip_max, alignment, calibration_id)
+    if errors:
+        raise ValueError("拒绝追加: " + "; ".join(errors))
+    axis, matches, diagnostics, quality = align_episode(buf, fps, trim, alignment)
+    state, pose = np.asarray(buf.state), np.asarray(buf.pose)
+    if (state.shape != (len(buf.state), 7) or pose.shape != (len(buf.pose), 7)
+            or not np.isfinite(state).all() or not np.isfinite(pose).all()):
+        raise ValueError("joint/pose samples must be finite 7-D vectors")
     has_img = len(buf.imgs) > 0
     if has_img:
         from PIL import Image
         import io
-        img_ts = np.array(buf.img_ts)
-        imgs = [np.asarray(Image.open(io.BytesIO(b))) for b in buf.imgs]
-        t0, t1 = img_ts[0], img_ts[-1]   # 相机是覆盖最窄的流, 用它定界
-    else:
-        t0, t1 = state_ts[0], state_ts[-1]
-    axis_ts = np.arange(t0, t1, 1.0 / fps)
-    if trim > 0:
-        axis_ts = axis_ts[(axis_ts >= t0 + trim) & (axis_ts <= t1 - trim)]
-    if len(axis_ts) < 10:
-        raise ValueError("掐头去尾后数据过短")
-    if has_img:
-        imgs = [imgs[k] for k in nearest_indices(img_ts, axis_ts)]
-
-    qi = nearest_indices(state_ts, axis_ts)
+        # Decode selected frames only. Explicit RGB avoids grayscale/RGBA schema drift.
+        cache = {}
+        imgs = []
+        for index in matches["camera"]["source_index"][:-1]:
+            if int(index) not in cache:
+                with Image.open(io.BytesIO(buf.imgs[index])) as image:
+                    cache[int(index)] = np.asarray(image.convert("RGB"))
+            imgs.append(cache[int(index)])
+        if len({image.shape for image in imgs}) != 1:
+            raise ValueError("camera resolution changed within episode")
+    existing_info = ds_dir / "meta/info.json"
+    if existing_info.is_file():
+        video_present = "observation.images.wrist" in json.loads(existing_info.read_text())["features"]
+        if video_present != has_img:
+            raise ValueError("camera presence differs from the existing dataset; use a new --dataset")
+    qi = matches["joints"]["source_index"]
     joints = state[qi].copy()
     joints[:, 6] = np.clip(joints[:, 6] / grip_max, 0.0, 1.0)
-    p = pose[nearest_indices(pose_ts, axis_ts)]
+    p = pose[matches["pose"]["source_index"]]
     rot6 = np.stack([quat_to_6d(*q) for q in p[:, 3:7]])
     ee = np.concatenate([p[:, :3], rot6, joints[:, 6:7]], axis=1)
 
@@ -109,7 +159,7 @@ def write_episode(buf, root, task, action_mode="ee", fps=20,
         act = np.concatenate([p[:, :3], rot6, joints[:, 6:7]], axis=1)
 
     # 第i帧行动=第i+1帧动作(末帧丢弃)
-    n = len(axis_ts) - 1
+    n = len(axis) - 1
     ee, joints = ee[:n].astype(np.float32), joints[:n].astype(np.float32)
     act = act[1:].astype(np.float32)
 
@@ -121,34 +171,60 @@ def write_episode(buf, root, task, action_mode="ee", fps=20,
         "action": {"dtype": "float32",
                    "shape": (10 if action_mode == "ee" else 7,),
                    "names": None},
+        **diagnostic_features(has_img),
     }
     # 任务层目录: <root>/<任务名>/ 本身即一个LeRobot数据集
     # (lerobot 0.4.4中create的root参数就是数据集目录本身, repo_id仅是标签)
-    tdir = task_dirname(task)
-    ds_dir = os.path.join(root, tdir)
-    append_mode = os.path.exists(os.path.join(ds_dir, "meta", "info.json"))
-    if append_mode:
-        ds = LeRobotDataset(tdir, root=ds_dir)
-        ds.vcodec = "h264"   # 追加模式不会沿用create时的编码器, 必须显式指定,
-        # 否则默认libsvtav1(AV1), 多数播放器解不了
-    else:
-        if has_img:
-            h, w = imgs[0].shape[:2]
-            feats["observation.images.wrist"] = {
-                "dtype": "video", "shape": (h, w, 3),
-                "names": ["height", "width", "channels"]}
-        ds = LeRobotDataset.create(
-            repo_id=tdir, root=ds_dir, fps=int(fps),
-            features=feats, vcodec="h264")
-
-    for i in range(n):
-        frame = {"observation.state": ee[i], "observation.joints": joints[i],
-                 "action": act[i], "task": task}
-        if has_img:
-            frame["observation.images.wrist"] = imgs[i]
-        ds.add_frame(frame)
-    ds.save_episode()
-    ds.finalize()
+    with safe_lerobot_statistics():
+        if (ds_dir / "meta/info.json").exists():
+            ds = LeRobotDataset(tdir, root=ds_dir)
+            ds.vcodec = "h264"
+            if has_img and tuple(ds.features["observation.images.wrist"]["shape"]) != imgs[0].shape:
+                raise ValueError("camera resolution differs from the existing dataset")
+        else:
+            if has_img:
+                h, w = imgs[0].shape[:2]
+                feats["observation.images.wrist"] = {
+                    "dtype": "video", "shape": (h, w, 3),
+                    "names": ["height", "width", "channels"]}
+            ds = LeRobotDataset.create(
+                repo_id=tdir, root=ds_dir, fps=int(fps), features=feats, vcodec="h264")
+        contract = acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id)
+        write_json_atomic(ds_dir / "meta/acquisition/dataset_contract.json", contract)
+        episode_index = int(ds.meta.total_episodes)
+        sidecar = ds_dir / f"meta/acquisition/episode_{episode_index:06d}.json"
+        pending = sidecar.with_suffix(".pending.json")
+        provenance = {
+            **buf.metadata, "schema_version": ACQUISITION_SCHEMA_VERSION,
+            "episode_index": episode_index, "task": task, "contract": contract,
+            "alignment_report": quality, "status": "pending",
+            "acq_columns_are_model_inputs": False, "acq_columns_have_normalization_stats": False,
+            "image_statistics_adapter": "float64 before squaring; scoped lerobot 0.4.4 adapter",
+        }
+        write_json_atomic(pending, provenance)
+        try:
+            for i in range(n):
+                frame = {"observation.state": ee[i], "observation.joints": joints[i],
+                         "action": act[i], "task": task}
+                frame.update({key: np.asarray([value[i]], dtype=np.int64)
+                              for key, value in diagnostics.items()})
+                if has_img:
+                    frame["observation.images.wrist"] = imgs[i]
+                ds.add_frame(frame)
+            ds.save_episode(parallel_encoding=False)
+            ds.finalize()
+        except Exception:
+            # Do not clean images or mark completion after a partial write.
+            # Closing writers preserves diagnostic files for explicit recovery.
+            try:
+                ds.finalize()
+            except Exception as close_error:
+                warnings.warn(f"Failed closing partial dataset: {close_error}")
+            raise
+        provenance.update(status="complete", finalized_at_utc=datetime.now(timezone.utc).isoformat())
+        write_json_atomic(sidecar, provenance)
+        pending.unlink()
+        cleanup_empty_images(ds_dir, ds.meta.video_keys)
     # 去锁: 容器写入进程的uid与本机用户不同, 开放读写避免本机文件管理器显示锁
-    subprocess.run(["chmod", "-R", "a+rwX", ds_dir], check=False)
+    subprocess.run(["chmod", "-R", "a+rwX", str(ds_dir)], check=False)
     return n
