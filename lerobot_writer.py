@@ -14,7 +14,8 @@ import numpy as np
 
 from acquisition import (
     ACQUISITION_SCHEMA_VERSION, AlignmentConfig, AlignmentError, EpisodeBuffer,
-    align_episode, diagnostic_features, nearest_indices, schema_errors, write_json_atomic,
+    align_episode, command_features, master_pose_features, diagnostic_features, nearest_indices, schema_errors,
+    write_json_atomic, write_raw_streams,
 )
 from lerobot_stats import safe_lerobot_statistics
 
@@ -38,7 +39,7 @@ def task_dirname(task):
     return name.strip("_")[:80] or "task"
 
 
-def acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id=""):
+def acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id="", master_pose_source=None):
     return {
         "schema_version": ACQUISITION_SCHEMA_VERSION, "fps": int(fps),
         "action_mode": action_mode, "gripper_max_rad": float(grip_max),
@@ -46,11 +47,12 @@ def acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id="
         "header_clock_domain": alignment.header_clock_domain,
         "require_camera": alignment.require_camera,
         "calibration_id": calibration_id,
+        "master_pose_source": master_pose_source,
     }
 
 
 def dataset_compatibility_errors(ds_dir, fps, action_mode, grip_max, alignment,
-                                 calibration_id=""):
+                                 calibration_id="", master_pose_source=None):
     """Read-only preflight, also called before recording starts."""
     ds_dir = Path(ds_dir)
     info_path = ds_dir / "meta/info.json"
@@ -66,7 +68,7 @@ def dataset_compatibility_errors(ds_dir, fps, action_mode, grip_max, alignment,
             errors.append("缺少新版采集契约；旧数据请保留并换一个--dataset名称")
         else:
             actual = json.loads(contract_path.read_text())
-            expected = acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id)
+            expected = acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id, master_pose_source)
             if actual != expected:
                 errors.append(f"采集契约变化：已保存{actual}，当前{expected}；请换--dataset")
         if any((ds_dir / "meta/acquisition").glob("episode_*.pending.json")):
@@ -116,7 +118,8 @@ def write_episode(buf, root, task, action_mode="ee", fps=20,
     tdir = task_dirname(task)
     ds_dir = Path(root) / tdir
     errors = dataset_compatibility_errors(
-        ds_dir, fps, action_mode, grip_max, alignment, calibration_id)
+        ds_dir, fps, action_mode, grip_max, alignment, calibration_id,
+        master_pose_source=buf.metadata.get("master_pose_source"))
     if errors:
         raise ValueError("拒绝追加: " + "; ".join(errors))
     axis, matches, diagnostics, quality = align_episode(buf, fps, trim, alignment)
@@ -144,6 +147,7 @@ def write_episode(buf, root, task, action_mode="ee", fps=20,
         if video_present != has_img:
             raise ValueError("camera presence differs from the existing dataset; use a new --dataset")
     qi = matches["joints"]["source_index"]
+    gripper_raw = np.asarray(state[qi[:-1], 6:7], dtype=np.float64).copy()
     joints = state[qi].copy()
     joints[:, 6] = np.clip(joints[:, 6] / grip_max, 0.0, 1.0)
     p = pose[matches["pose"]["source_index"]]
@@ -171,6 +175,8 @@ def write_episode(buf, root, task, action_mode="ee", fps=20,
         "action": {"dtype": "float32",
                    "shape": (10 if action_mode == "ee" else 7,),
                    "names": None},
+        **command_features(),
+        **master_pose_features(),
         **diagnostic_features(has_img),
     }
     # 任务层目录: <root>/<任务名>/ 本身即一个LeRobot数据集
@@ -189,23 +195,36 @@ def write_episode(buf, root, task, action_mode="ee", fps=20,
                     "names": ["height", "width", "channels"]}
             ds = LeRobotDataset.create(
                 repo_id=tdir, root=ds_dir, fps=int(fps), features=feats, vcodec="h264")
-        contract = acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id)
+        contract = acquisition_contract(fps, action_mode, grip_max, alignment, calibration_id,
+                                        buf.metadata.get("master_pose_source"))
         write_json_atomic(ds_dir / "meta/acquisition/dataset_contract.json", contract)
         episode_index = int(ds.meta.total_episodes)
         sidecar = ds_dir / f"meta/acquisition/episode_{episode_index:06d}.json"
         pending = sidecar.with_suffix(".pending.json")
+        raw_path = sidecar.with_suffix(".streams.jsonl")
         provenance = {
             **buf.metadata, "schema_version": ACQUISITION_SCHEMA_VERSION,
             "episode_index": episode_index, "task": task, "contract": contract,
             "alignment_report": quality, "status": "pending",
             "acq_columns_are_model_inputs": False, "acq_columns_have_normalization_stats": False,
             "image_statistics_adapter": "float64 before squaring; scoped lerobot 0.4.4 adapter",
+            "command_columns_are_model_inputs": False,
+            "command_columns_have_normalization_stats": False,
+            "master_ee_pose_is_model_input": False, "master_ee_pose_has_normalization_stats": False,
+            "command_alignment": "last published at/before matched joint-feedback host receipt; no hardware acknowledgement",
+            "raw_streams": {"path": str(raw_path.relative_to(ds_dir)), "format": "jsonl"},
         }
         write_json_atomic(pending, provenance)
         try:
+            provenance["raw_streams"].update(write_raw_streams(buf, raw_path))
+            write_json_atomic(pending, provenance)
             for i in range(n):
                 frame = {"observation.state": ee[i], "observation.joints": joints[i],
-                         "action": act[i], "task": task}
+                         "action": act[i], "task": task,
+                         "observation.gripper_position": gripper_raw[i],
+                         "command.joints": matches["command_joints"]["values"][i],
+                         "command.gripper": matches["command_gripper"]["values"][i],
+                         "observation.master_ee_pose": matches["master_pose"]["values"][i]}
                 frame.update({key: np.asarray([value[i]], dtype=np.int64)
                               for key, value in diagnostics.items()})
                 if has_img:

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -13,12 +14,14 @@ import time
 import numpy as np
 
 
-ACQUISITION_SCHEMA_VERSION = 1
-STREAMS = ("joints", "pose", "camera")
+ACQUISITION_SCHEMA_VERSION = 3
+STREAMS = ("joints", "pose", "camera", "master_pose")
 TOPICS = {
     "joints": "/joint_states",
     "pose": "/arm/end_pose",
     "camera": "/eye_in_hand/eye_in_hand/image_raw/image_compressed",
+    "command_joints": "/joint_position_controller/commands",
+    "command_gripper": "/gripper_controller/commands",
 }
 
 
@@ -79,12 +82,17 @@ class EpisodeBuffer:
         self.state, self.state_ts = [], []
         self.pose, self.pose_ts = [], []
         self.imgs, self.img_ts = [], []
-        self.aj, self.aj_ts = [], []  # retained for command diagnostics, not action labels
+        self.master_pose, self.master_pose_ts, self.master_pose_carried = [], [], []
+        self.aj, self.aj_ts = [], []
         self.ag, self.ag_ts = [], []
+        self.command_trace = {
+            s: {"publish_mono_ns": [], "carried_from_before_recording": []}
+            for s in ("joints", "gripper")
+        }
         self.trace = {s: {"header_ns": [], "receive_ns": [], "frame_id": []} for s in STREAMS}
         self.metadata = metadata or {}
 
-    def append(self, stream, value, msg=None, receive_ns=None, header_ns=None, frame_id=None):
+    def append(self, stream, value, msg=None, receive_ns=None, header_ns=None, frame_id=None, carried=False):
         receive_ns = time.monotonic_ns() if receive_ns is None else int(receive_ns)
         recorded_header, recorded_frame = header_values(msg)
         header_ns = recorded_header if header_ns is None else int(header_ns)
@@ -93,15 +101,39 @@ class EpisodeBuffer:
             "joints": (self.state, self.state_ts),
             "pose": (self.pose, self.pose_ts),
             "camera": (self.imgs, self.img_ts),
+            "master_pose": (self.master_pose, self.master_pose_ts),
         }[stream]
         values.append(value)
         times.append(receive_ns / 1e9)  # compatibility only; alignment uses integer trace
         self.trace[stream]["header_ns"].append(header_ns)
         self.trace[stream]["receive_ns"].append(receive_ns)
         self.trace[stream]["frame_id"].append(frame_id)
+        if stream == "master_pose":
+            self.master_pose_carried.append(bool(carried))
 
     def has_data(self):
         return len(self.state) > 10
+
+    def append_command(self, stream, values, publish_mono_ns, *, carried=False):
+        """Record only successfully published, post-limit Float64 targets."""
+        if stream not in self.command_trace:
+            raise ValueError(f"unknown command stream: {stream}")
+        vector = np.asarray(values, dtype=np.float64)
+        width = 6 if stream == "joints" else 1
+        if vector.shape != (width,) or not np.isfinite(vector).all():
+            raise ValueError(f"{stream} command must be a finite {width}-D vector")
+        if (isinstance(publish_mono_ns, (bool, np.bool_))
+                or not isinstance(publish_mono_ns, (int, np.integer))
+                or not 0 < publish_mono_ns <= np.iinfo(np.int64).max):
+            raise ValueError("publish_mono_ns must be a positive int64 timestamp")
+        trace = self.command_trace[stream]
+        if trace["publish_mono_ns"] and publish_mono_ns <= trace["publish_mono_ns"][-1]:
+            raise ValueError(f"{stream} publish timestamps must strictly increase")
+        values_list, times = (self.aj, self.aj_ts) if stream == "joints" else (self.ag, self.ag_ts)
+        values_list.append(vector.tolist())
+        times.append(int(publish_mono_ns) / 1e9)  # compatibility; integer trace is authoritative
+        trace["publish_mono_ns"].append(int(publish_mono_ns))
+        trace["carried_from_before_recording"].append(bool(carried))
 
 
 def capture_provenance(args, repo_dir=None):
@@ -128,11 +160,15 @@ def capture_provenance(args, repo_dir=None):
                     "lerobot_adapter_version": "0.4.4"},
         "actual_arguments": vars(args).copy(),
         "topics": TOPICS,
-        "units": {"position": "m", "joint": "rad", "gripper": "measured_rad / gripper_max"},
+        "units": {"position": "m", "joint": "rad", "gripper": "measured_rad / gripper_max",
+                  "command.joints": "rad", "command.gripper": "rad",
+                  "observation.gripper_position": "rad", "raw_feedback_joints": "rad",
+                  "observation.master_ee_pose": "xyz in m; quaternion qx,qy,qz,qw"},
         "state_layout": ["xyz", "rotation6d_first_two_matrix_rows", "gripper_fraction"],
         "raw_pose_layout": ["x", "y", "z", "qx", "qy", "qz", "qw"],
         "coordinate_transform_applied": None,
         "action_definition": "next resampled measured state; last observation dropped",
+        "command_definition": "last published target at/before joint feedback receipt; no controller acknowledgement",
         "coordinate_calibration": {
             "id": getattr(args, "calibration_id", ""),
             "physical_axes_and_tool_zero_verified": False,
@@ -150,7 +186,104 @@ def diagnostic_features(has_camera=True):
             "header_time_ns", "receive_mono_ns", "source_index", "match_error_ns",
             "source_age_ns", "source_gap_ns", "valid",
         ))
+    for stream in ("command_joints", "command_gripper"):
+        keys.extend(f"acq.{stream}.{field}" for field in (
+            "publish_mono_ns", "reference_mono_ns", "source_index", "age_ns", "valid",
+        ))
+    keys.extend(f"acq.master_pose.{field}" for field in (
+        "header_time_ns", "receive_mono_ns", "reference_mono_ns", "source_index", "age_ns", "valid",
+    ))
     return {key: {"dtype": "int64", "shape": (1,), "names": None} for key in keys}
+
+
+def command_features():
+    return {
+        "command.joints": {"dtype": "float64", "shape": (6,), "names": None},
+        "command.gripper": {"dtype": "float64", "shape": (1,), "names": None},
+        "observation.gripper_position": {"dtype": "float64", "shape": (1,), "names": None},
+    }
+
+
+def master_pose_features():
+    return {"observation.master_ee_pose": {"dtype": "float64", "shape": (7,), "names": None}}
+
+
+def align_master_pose(buf, reference_mono_ns, config):
+    """Auxiliary master pose: causal host-clock hold; source ROS clocks stay separate."""
+    if not buf.master_pose:
+        raise AlignmentError("missing master EE pose stream; check --master-ee-topic")
+    if buf.metadata.get("master_pose_source_changed"):
+        raise AlignmentError("master EE topic/type/side/frame changed within episode")
+    trace = buf.trace["master_pose"]
+    count = len(buf.master_pose)
+    if any(len(values) != count for values in trace.values()) or len(buf.master_pose_carried) != count:
+        raise AlignmentError("incomplete master EE pose provenance")
+    poses = np.asarray(buf.master_pose, dtype=np.float64)
+    receive = np.asarray(trace["receive_ns"], dtype=np.int64)
+    header = np.asarray(trace["header_ns"], dtype=np.int64)
+    if (poses.shape != (count, 7) or not np.isfinite(poses).all()
+            or np.any(np.sum(poses[:, 3:] ** 2, axis=1) < 1e-16)
+            or np.any(receive <= 0) or np.any(np.diff(receive) <= 0)):
+        raise AlignmentError("invalid master EE pose values/receipt timestamps")
+    frames = set(trace["frame_id"])
+    if len(frames) != 1 or np.any(header < 0) or np.any(np.diff(header[header > 0]) <= 0):
+        raise AlignmentError("master EE frame_id changed or positive header stamps repeated/reversed")
+    reference = np.asarray(reference_mono_ns, dtype=np.int64)
+    indices = np.searchsorted(receive, reference, side="right") - 1
+    has_sample = indices >= 0
+    values = np.zeros((len(reference), 7), dtype=np.float64)
+    selected_receive, selected_header = np.zeros_like(reference), np.zeros_like(reference)
+    values[has_sample] = poses[indices[has_sample]]
+    selected_receive[has_sample] = receive[indices[has_sample]]
+    selected_header[has_sample] = header[indices[has_sample]]
+    age = np.where(has_sample, reference - selected_receive, -1)
+    valid = has_sample & (age <= config.max_age_ms * 1e6)
+    if not valid.any():
+        raise AlignmentError("master EE pose has no fresh matches; check stream continuity/timestamps")
+    item = {"values": values, "header_time_ns": selected_header, "receive_mono_ns": selected_receive,
+            "reference_mono_ns": reference, "source_index": indices.astype(np.int64),
+            "age_ns": age, "valid": valid.astype(np.int64)}
+    diag = {f"acq.master_pose.{k}": v for k, v in item.items() if k != "values"}
+    report = {"recorded_samples": count, "invalid_frames": int((~valid).sum()),
+              "frame_id": next(iter(frames)), "frame_id_known": bool(next(iter(frames))),
+              "carried_samples": int(sum(buf.master_pose_carried)),
+              "alignment_clock": "collector monotonic receipt; master ROS header clock not assumed synchronized",
+              "source": buf.metadata.get("master_pose_source")}
+    return item, diag, report
+
+
+def align_commands(buf, reference_mono_ns):
+    """Causal sample-and-hold on the joint-feedback receipt clock, also in header mode."""
+    reference = np.asarray(reference_mono_ns, dtype=np.int64)
+    matches, diagnostics, report = {}, {}, {}
+    for stream, values in (("joints", buf.aj), ("gripper", buf.ag)):
+        trace = buf.command_trace[stream]
+        times = np.asarray(trace["publish_mono_ns"], dtype=np.int64)
+        if len(times) != len(values) or len(times) != len(trace["carried_from_before_recording"]):
+            raise AlignmentError(f"{stream}: incomplete command provenance")
+        width = 6 if stream == "joints" else 1
+        vectors = np.asarray(values, dtype=np.float64).reshape(-1, width)
+        if (vectors.shape != (len(times), width) or not np.isfinite(vectors).all()
+                or np.any(times <= 0) or np.any(np.diff(times) <= 0)):
+            raise AlignmentError(f"{stream}: invalid command values/timestamps")
+        indices = np.searchsorted(times, reference, side="right") - 1
+        valid = indices >= 0
+        selected, published = np.zeros((len(reference), width)), np.zeros(len(reference), dtype=np.int64)
+        if valid.any():
+            selected[valid] = vectors[indices[valid]]
+            published[valid] = times[indices[valid]]
+        item = {
+            "values": selected, "source_index": indices.astype(np.int64),
+            "publish_mono_ns": published, "reference_mono_ns": reference,
+            "age_ns": np.where(valid, reference - published, -1), "valid": valid.astype(np.int64),
+        }
+        key = f"command_{stream}"
+        matches[key] = item
+        diagnostics.update({f"acq.{key}.{name}": value for name, value in item.items() if name != "values"})
+        report[key] = {"recorded_samples": len(times), "missing_frame_targets": int((~valid).sum()),
+                       "carried_samples": int(sum(trace["carried_from_before_recording"])),
+                       "alignment": "last published at/before matched joint-feedback receive_mono_ns"}
+    return matches, diagnostics, report
 
 
 def schema_errors(info, fps, action_mode="ee", require_camera=True):
@@ -160,6 +293,8 @@ def schema_errors(info, fps, action_mode="ee", require_camera=True):
         "observation.state": {"dtype": "float32", "shape": (10,)},
         "observation.joints": {"dtype": "float32", "shape": (7,)},
         "action": {"dtype": "float32", "shape": (10 if action_mode == "ee" else 7,)},
+        **command_features(),
+        **master_pose_features(),
         **diagnostic_features(require_camera or "observation.images.wrist" in features),
     }
     errors = []
@@ -291,7 +426,65 @@ def align_episode(buf, fps=20, trim=0.5, config=None):
             diagnostics[f"acq.{stream}.{key}"] = value[:-1]
             if stream in ("pose", "joints"):
                 diagnostics[f"acq.action_{stream}.{key}"] = value[1:]
+    command_matches, command_diag, command_report = align_commands(
+        buf, matches["joints"]["receive_mono_ns"][:-1])
+    matches.update(command_matches)
+    diagnostics.update(command_diag)
+    report["commands"] = command_report
+    master_match, master_diag, master_report = align_master_pose(
+        buf, matches["joints"]["receive_mono_ns"][:-1], cfg)
+    matches["master_pose"] = master_match
+    diagnostics.update(master_diag)
+    report["master_pose"] = master_report
     return axis, matches, diagnostics, report
+
+
+def write_raw_streams(buf, path):
+    """Atomically save every recorded command and joint feedback before resampling/trim."""
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    if path.exists() or temporary.exists():
+        raise FileExistsError(f"Refusing to replace raw acquisition stream: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    counts = {"command.joints": 0, "command.gripper": 0, "feedback.joints": 0, "feedback.master_ee_pose": 0}
+    digest = hashlib.sha256()
+    with temporary.open("xb") as output:
+        def emit(row):
+            payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+            output.write(payload)
+            digest.update(payload)
+            counts[row["stream"]] += 1
+        for stream, values in (("joints", buf.aj), ("gripper", buf.ag)):
+            trace = buf.command_trace[stream]
+            for index, vector in enumerate(values):
+                emit({"stream": f"command.{stream}", "sample_index": index,
+                      "publish_mono_ns": trace["publish_mono_ns"][index],
+                      "carried_from_before_recording": trace["carried_from_before_recording"][index],
+                      "values": [float(v) for v in vector]})
+        trace = buf.trace["joints"]
+        for index, vector in enumerate(buf.state):
+            emit({"stream": "feedback.joints", "sample_index": index,
+                  "receive_mono_ns": trace["receive_ns"][index],
+                  "header_time_ns": trace["header_ns"][index], "frame_id": trace["frame_id"][index],
+                  "values": [float(v) for v in vector]})
+        trace = buf.trace["master_pose"]
+        for index, vector in enumerate(buf.master_pose):
+            emit({"stream": "feedback.master_ee_pose", "sample_index": index,
+                  "receive_mono_ns": trace["receive_ns"][index],
+                  "header_time_ns": trace["header_ns"][index], "frame_id": trace["frame_id"][index],
+                  "carried_from_before_recording": buf.master_pose_carried[index],
+                  "values": [float(v) for v in vector]})
+        output.flush()
+        os.fsync(output.fileno())
+    # Atomic publication without replacing an existing file, even on a racing retry.
+    os.link(temporary, path)
+    temporary.unlink()
+    return {"format": "jsonl", "counts": counts, "sha256": digest.hexdigest(),
+            "joint_order": [f"arm_joint{i}" for i in range(1, 7)],
+            "units": {"command.joints": "rad", "command.gripper": "rad",
+                      "feedback.joints": "rad; arm_gripper is value[6]",
+                      "feedback.master_ee_pose": "xyz in m; quaternion qx,qy,qz,qw"},
+            "coverage": "all recording samples before trim/resampling, plus explicitly marked carried command/master-pose samples"}
 
 
 def write_json_atomic(path, value):

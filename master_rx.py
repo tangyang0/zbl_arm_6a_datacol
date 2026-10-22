@@ -19,6 +19,7 @@ import time
 
 import websockets
 from websockets.sync.client import connect as ws_connect
+from master_pose import discover_master_pose_topic, parse_master_pose_message
 
 
 def log_line(msg):
@@ -35,6 +36,8 @@ def main():
     p.add_argument('--throttle-ms', type=int, default=5,
                    help='rosbridge服务端节流间隔ms(5=200Hz)')
     p.add_argument('--port', type=int, default=9870)
+    p.add_argument('--master-ee-topic', default='auto',
+                   help='主臂PoseStamped话题；auto只选择明确标记master/leader及左右侧的唯一话题')
     args = p.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -45,6 +48,15 @@ def main():
         try:
             # max_queue=1: 库内部只保留最新一条消息, 自动丢弃积压旧帧
             with ws_connect(args.master, open_timeout=5, max_queue=1) as ws:
+                pose_topic = None
+                try:
+                    pose_topic = discover_master_pose_topic(ws, args.side, args.master_ee_topic)
+                except (ValueError, TimeoutError) as exc:
+                    log_line(f"主臂EE订阅未就绪: {exc}; 关节遥操继续，数采将拒绝缺少EE的episode")
+                if pose_topic:
+                    ws.send(json.dumps({"op": "subscribe", "topic": pose_topic, "queue_length": 1}))
+                    log_line(f"主臂EE订阅: {pose_topic} (PoseStamped xyz+quaternion xyzw)")
+                last_pose_error = 0.0
                 ws.send(json.dumps(
                     {"op": "subscribe", "topic": "/joint_states",
                      "throttle_rate": args.throttle_ms,
@@ -60,6 +72,7 @@ def main():
                          f"转发到 udp/{dest[0]}:{dest[1]}")
                 while True:
                     raw = ws.recv(timeout=5.0)
+                    received_ns = time.monotonic_ns()
                     if isinstance(raw, bytes):
                         raw = raw.decode("utf-8", "ignore")
                     try:
@@ -82,6 +95,14 @@ def main():
                         sock.sendto(
                             ("MJ " + " ".join(f"{v:.6f}" for v in pos))
                             .encode(), dest)
+                    elif pose_topic and t == pose_topic:
+                        try:
+                            packet = parse_master_pose_message(m, pose_topic, received_ns, args.side)
+                            sock.sendto(("MP " + json.dumps(packet, allow_nan=False)).encode(), dest)
+                        except (ValueError, TypeError) as exc:
+                            if time.monotonic() - last_pose_error > 2.0:
+                                log_line(f"拒绝非法主臂EE消息: {exc}")
+                                last_pose_error = time.monotonic()
                     elif "joy_trigger" in t:
                         sock.sendto(("TRIG " + json.dumps(m)).encode(), dest)
                     elif "_joystick/input" in t:

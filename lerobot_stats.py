@@ -21,13 +21,14 @@ def check_lerobot_version():
 
 
 def safe_episode_stats(episode_data, features, quantile_list=None):
-    """Skip acq.* and promote pixels before squaring (uint8 otherwise overflows)."""
+    """Skip acquisition/command diagnostics; promote pixels before squaring."""
     from lerobot.datasets.compute_stats import get_feature_stats, sample_images
 
     stats = {}
     for key, data in episode_data.items():
         spec = features[key]
-        if key.startswith("acq.") or spec["dtype"] == "string":
+        if (key.startswith(("acq.", "command.")) or key == "observation.master_ee_pose"
+                or spec["dtype"] == "string"):
             continue
         image = spec["dtype"] in ("image", "video")
         values = sample_images(data) if image else np.asarray(data)

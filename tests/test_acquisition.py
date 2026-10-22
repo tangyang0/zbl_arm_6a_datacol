@@ -24,8 +24,10 @@ from lerobot_writer import (
 )
 
 
-def make_buffer(camera=True):
-    buf = EpisodeBuffer({"fixture": True})
+def make_buffer(camera=True, master_pose=True):
+    buf = EpisodeBuffer({"fixture": True, "master_pose_source": {
+        "topic": "/master_right/ee_pose", "message_type": "geometry_msgs/PoseStamped",
+        "side": "right", "frame_id": "master_base"}})
     for i in range(21):
         receive = 10**12 + i * 50_000_000
         header = 1_700_000_000_000_000_123 + i * 50_000_000
@@ -33,6 +35,10 @@ def make_buffer(camera=True):
                    receive_ns=receive, header_ns=header, frame_id="base")
         buf.append("pose", [0.001 * i, 0.1, 0.2, 0, 0, 0, 1],
                    receive_ns=receive, header_ns=header, frame_id="base")
+        if master_pose:
+            buf.append("master_pose", [0.3 + 0.001 * i, 0.2, 0.4, 0, 0, 0, 1],
+                       receive_ns=receive, header_ns=123_456_789 + i * 50_000_000,
+                       frame_id="master_base")
         if camera:
             from PIL import Image
             image = np.arange(48 * 64 * 3, dtype=np.uint8).reshape(48, 64, 3)
@@ -68,7 +74,8 @@ class AlignmentTests(unittest.TestCase):
             except ValueError:
                 return None
         owner = SimpleNamespace(rec_buf=EpisodeBuffer(), slave_gripper=.7,
-                                slave_joints=None, pick_joints=pick)
+                                slave_joints=None, pick_joints=pick,
+                                _rec_stream_lock=threading.RLock())
         header = SimpleNamespace(stamp=SimpleNamespace(sec=123, nanosec=456), frame_id="base")
         msg = SimpleNamespace(name=[f"arm_joint{i}" for i in range(1, 7)],
                               position=[0.] * 6, header=header)
@@ -452,6 +459,7 @@ class LeRobotIntegrationTests(unittest.TestCase):
             self.assertIs(module.compute_episode_stats, original_stats)
             self.assertTrue(list((dsroot / "images").rglob("*.png")))
             self.assertTrue(list((dsroot / "meta/acquisition").glob("*.pending.json")))
+            self.assertTrue((dsroot / "meta/acquisition/episode_000000.streams.jsonl").is_file())
             self.assertFalse((dsroot / "meta/acquisition/episode_000000.json").exists())
             self.assertTrue(dataset_compatibility_errors(dsroot, 20, "ee", 1.7, AlignmentConfig()))
 

@@ -41,6 +41,7 @@ from lerobot_writer import (
     EpisodeBuffer, write_episode, task_dirname, dataset_compatibility_errors,
 )
 from acquisition import alignment_from_args, capture_provenance, AlignmentError
+from master_pose import validate_master_pose_packet, master_pose_source
 from lerobot_stats import check_lerobot_version
 
 # 从臂关节限位(来源: examples/python/joint_control.py, rad)
@@ -88,6 +89,7 @@ class MasterBridge(Node):
     def __init__(self, args):
         super().__init__('master_bridge')
         self.args = args
+        self._rec_stream_lock = threading.RLock()
         self._warn_ts = {}          # 节流warn的上次打印时刻
         self.joint_cmd_pub = self.create_publisher(
             Float64MultiArray, '/joint_position_controller/commands', 10)
@@ -105,11 +107,13 @@ class MasterBridge(Node):
             SwitchController, '/controller_manager/switch_controller')
 
         self.master_joints = None       # 最近一帧主臂6关节
+        self.master_ee_pose_packet = None
         self.master_last_ts = 0.0
         self.master_rx_perf = 0.0       # 最近一帧到达时刻(perf_counter)
         self.slave_joints = None
         self.slave_gripper = None       # 从臂夹爪位置(rad, 0=合, 满开~4.5)
         self.last_cmd = None
+        self.last_joint_publish_ns = None
         self._follow_enabled = False    # 启动阶段(归零/对齐)先挡住tick的跟随发布
         self.trigger_count = 0
         self._last_log = -1
@@ -128,6 +132,7 @@ class MasterBridge(Node):
         self.trig_open = 0.0            # 0=合 1=全开
         self.grip_target = None         # 夹爪目标(rad)
         self.grip_last_cmd = None       # 最近一次已发布夹爪指令(rad)
+        self.last_gripper_publish_ns = None
         self.gripper_cmd_pub = self.create_publisher(
             Float64MultiArray, '/gripper_controller/commands', 10)
         # 延迟诊断: 主臂帧到达间隔 / 发布时帧龄 / tick周期
@@ -420,7 +425,7 @@ class MasterBridge(Node):
         now_pc = time.perf_counter()
         for _ in range(200):   # 每tick最多取200帧, 防极端积压占用
             try:
-                data, _ = self.udp.recvfrom(2048)
+                data, _ = self.udp.recvfrom(16384)
             except BlockingIOError:
                 break
             if data.startswith(b"MJ "):
@@ -439,6 +444,13 @@ class MasterBridge(Node):
                 self.master_joints = pos
                 self.master_last_ts = time.time()
                 self.master_rx_perf = now_pc
+            elif data.startswith(b"MP "):
+                try:
+                    packet = validate_master_pose_packet(json.loads(data[3:]), self.args.side)
+                except (ValueError, TypeError) as exc:
+                    self.log_throttle(f"拒绝主臂EE报文: {exc}", 2.0, "WARN")
+                    continue
+                self._accept_master_pose(packet)
             elif data.startswith(b"TRIG "):
                 try:
                     m = json.loads(data[5:])
@@ -451,6 +463,19 @@ class MasterBridge(Node):
                 except ValueError:
                     continue
                 self.on_joy(m)
+
+    def _accept_master_pose(self, packet):
+        with self._rec_stream_lock:
+            previous = self.master_ee_pose_packet
+            if previous and packet["receive_mono_ns"] <= previous["receive_mono_ns"]:
+                return
+            self.master_ee_pose_packet = packet
+            if self.rec_buf is not None:
+                if master_pose_source(packet) != self.rec_buf.metadata.get("master_pose_source"):
+                    self.rec_buf.metadata["master_pose_source_changed"] = True
+                self.rec_buf.append("master_pose", packet["pose"],
+                                    receive_ns=packet["receive_mono_ns"], header_ns=packet["header_time_ns"],
+                                    frame_id=packet["frame_id"])
 
     @staticmethod
     def pick_joints(msg, want_names):
@@ -579,23 +604,24 @@ class MasterBridge(Node):
         if grip is not None:
             self.slave_gripper = grip[0]
         # 数采: 观测流(6关节+夹爪)
-        if self.rec_buf is not None and pos is not None and grip is not None:
-            # Do not combine a fresh arm sample with an old cached gripper value.
-            self.rec_buf.append("joints", list(pos) + [grip[0]], msg, receive_ns)
+        with self._rec_stream_lock:
+            if self.rec_buf is not None and pos is not None and grip is not None:
+                # Do not combine a fresh arm sample with an old cached gripper value.
+                self.rec_buf.append("joints", list(pos) + [grip[0]], msg, receive_ns)
 
     def on_end_pose(self, msg):
         receive_ns = time.monotonic_ns()
-        if self.rec_buf is None:
-            return
         p, q = msg.pose.position, msg.pose.orientation
-        self.rec_buf.append("pose", [p.x, p.y, p.z, q.x, q.y, q.z, q.w],
-                            msg, receive_ns)
+        with self._rec_stream_lock:
+            if self.rec_buf is not None:
+                self.rec_buf.append("pose", [p.x, p.y, p.z, q.x, q.y, q.z, q.w],
+                                    msg, receive_ns)
 
     def on_image(self, msg):
         receive_ns = time.monotonic_ns()
-        if self.rec_buf is None:
-            return
-        self.rec_buf.append("camera", bytes(msg.data), msg, receive_ns)
+        with self._rec_stream_lock:
+            if self.rec_buf is not None:
+                self.rec_buf.append("camera", bytes(msg.data), msg, receive_ns)
 
     def gripper_str(self):
         if self.slave_gripper is None:
@@ -662,12 +688,14 @@ class MasterBridge(Node):
 
     def publish_joints(self, q):
         msg = Float64MultiArray()
-        msg.data = q
-        self.joint_cmd_pub.publish(msg)
-        self.last_cmd = q
-        if self.rec_buf is not None:
-            self.rec_buf.aj.append(list(q))
-            self.rec_buf.aj_ts.append(time.perf_counter())
+        msg.data = list(q)
+        with self._rec_stream_lock:
+            sent_ns = time.monotonic_ns()
+            self.joint_cmd_pub.publish(msg)
+            self.last_cmd = list(q)
+            self.last_joint_publish_ns = sent_ns
+            if self.rec_buf is not None:
+                self.rec_buf.append_command("joints", q, sent_ns)
 
     def bounce_gripper(self):
         """夹爪控制器去激活再激活, 强制其重新使能伺服。
@@ -762,11 +790,13 @@ class MasterBridge(Node):
             return
         msg = Float64MultiArray()
         msg.data = [cmd]
-        self.gripper_cmd_pub.publish(msg)
-        self.grip_last_cmd = cmd
-        if self.rec_buf is not None:
-            self.rec_buf.ag.append([cmd])
-            self.rec_buf.ag_ts.append(time.perf_counter())
+        with self._rec_stream_lock:
+            sent_ns = time.monotonic_ns()
+            self.gripper_cmd_pub.publish(msg)
+            self.grip_last_cmd = cmd
+            self.last_gripper_publish_ns = sent_ns
+            if self.rec_buf is not None:
+                self.rec_buf.append_command("gripper", [cmd], sent_ns)
 
     # ---------- 数采录制(sw1短按开/停episode) ----------
     def rec_ds_root(self):
@@ -795,7 +825,25 @@ class MasterBridge(Node):
         return dataset_compatibility_errors(
             os.path.dirname(os.path.dirname(info_path)),
             self.args.fps, self.args.action_mode, self.args.gripper_max,
-            alignment_from_args(self.args), self.args.calibration_id)
+            alignment_from_args(self.args), self.args.calibration_id,
+            master_pose_source=master_pose_source(self.master_ee_pose_packet)
+            if self.master_ee_pose_packet else None)
+
+    def _begin_recording(self, metadata):
+        """Carry genuine last publications into the episode, never cached feedback."""
+        with self._rec_stream_lock:
+            buf = EpisodeBuffer(metadata)
+            buf.metadata["recording_started_mono_ns"] = time.monotonic_ns()
+            if self.last_joint_publish_ns is not None:
+                buf.append_command("joints", self.last_cmd, self.last_joint_publish_ns, carried=True)
+            if self.last_gripper_publish_ns is not None:
+                buf.append_command("gripper", [self.grip_last_cmd], self.last_gripper_publish_ns, carried=True)
+            packet = getattr(self, "master_ee_pose_packet", None)
+            if packet is not None:
+                buf.metadata["master_pose_source"] = master_pose_source(packet)
+                buf.append("master_pose", packet["pose"], receive_ns=packet["receive_mono_ns"],
+                           header_ns=packet["header_time_ns"], frame_id=packet["frame_id"], carried=True)
+            self.rec_buf = buf
 
     def rec_toggle(self):
         """sw1: 开录(空闲时); 若有未保存的上一集=丢弃重录; 录制中无效(结束用sw3)"""
@@ -804,6 +852,10 @@ class MasterBridge(Node):
             return
         if self._home_busy:
             self.log("✗ 主臂回零进行中, 稍后再开录", "REC✗")
+            return
+        packet = self.master_ee_pose_packet
+        if packet is None or not 0 <= time.monotonic_ns() - packet["receive_mono_ns"] <= self.args.sync_max_age_ms * 1e6:
+            self.log("✗ 未收到新鲜主臂EE PoseStamped，拒绝开录；检查 --master-ee-topic 与主臂发布节点", "REC✗")
             return
         if self.rec_pending is None and self.rec_failed:
             self.rec_pending = self.rec_failed.pop(0)
@@ -820,7 +872,7 @@ class MasterBridge(Node):
                      f"不符({'; '.join(bad)}), 请换 --dataset 名称", "REC✗")
             return
         self.rec_ep += 1
-        self.rec_buf = EpisodeBuffer(capture_provenance(self.args))
+        self._begin_recording(capture_provenance(self.args))
         self.rec_dir = os.path.join(self.args.data_root, self.args.dataset)
         self.rec_t0 = time.time()
         self.log(f"▶▶▶ episode_{self.rec_ep:04d} 开始录制 -> LeRobot数据集 "
@@ -828,11 +880,12 @@ class MasterBridge(Node):
 
     def rec_stop(self, sync=False):
         """sw3: 结束本集 -> 数据挂起待保存(sw4确认写入 / sw1丢弃重录)"""
-        if self.rec_buf is None:
-            return
-        buf, ep = self.rec_buf, self.rec_ep
+        with self._rec_stream_lock:
+            if self.rec_buf is None:
+                return
+            buf, ep = self.rec_buf, self.rec_ep
+            self.rec_buf = None
         dur = time.time() - self.rec_t0
-        self.rec_buf = None
         # 过短的录制(测试性按压)掐头去尾后必然不足10帧, 直接丢弃不写
         if dur < self.args.trim * 2 + 0.6:
             self.log(f"✗ episode_{ep:04d} 时长{dur:.1f}s过短, 已丢弃"
@@ -1034,6 +1087,8 @@ def main():
                    help='使用哪个主臂(默认right)')
     p.add_argument('--master', default='ws://192.168.31.7:9090',
                    help='主臂PC rosbridge地址')
+    p.add_argument('--master-ee-topic', default='auto',
+                   help='主臂EE的PoseStamped话题；auto只发现明确带master/leader和左右侧的唯一话题')
     p.add_argument('--rate', type=float, default=100.0,
                    help='从臂指令发布频率Hz(默认100)')
     p.add_argument('--throttle-ms', type=int, default=5,
@@ -1100,6 +1155,9 @@ def main():
             raise ValueError('--trim必须为有限非负数')
         if not math.isfinite(args.gripper_max) or args.gripper_max <= 0:
             raise ValueError('--gripper-max必须为有限正数')
+        if args.master_ee_topic != 'auto' and (not args.master_ee_topic.startswith('/')
+                                              or any(c.isspace() for c in args.master_ee_topic)):
+            raise ValueError('--master-ee-topic必须为绝对ROS话题名或auto')
     except ValueError as exc:
         p.error(str(exc))
 
@@ -1109,6 +1167,7 @@ def main():
     rx_proc = subprocess.Popen(
         [sys.executable, rx_script,
          '--side', args.side, '--master', args.master,
+         '--master-ee-topic', args.master_ee_topic,
          '--throttle-ms', str(args.throttle_ms),
          '--port', str(args.port)])
     log_line(f"已拉起master_rx子进程 pid={rx_proc.pid}")

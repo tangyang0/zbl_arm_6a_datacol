@@ -164,6 +164,7 @@ ros2 control switch_controllers --deactivate joint_position_controller cart_pose
 |---|---|---|
 | --side | right | 用右主臂还是左主臂 |
 | --master | ws://192.168.31.7:9090 | 主臂PC rosbridge地址 |
+| --master-ee-topic | auto | 主臂EE的PoseStamped话题；自动识别失败时填已确认的实际话题 |
 | --engage | 关 | 不加只干跑打印, 加了才真控制 |
 | --rate | 100 | 从臂指令频率Hz |
 | --vmax | 3.0 | 跟随软限最大关节角速度rad/s |
@@ -214,14 +215,14 @@ docker push ghcr.io/tangyang0/zbl_arm_6a_datacol:v0.2.0
 
 ```bash
 # 容器内启动遥操, --task 用自然语言任务指令(VLA微调任务标签):
-python3 master_bridge.py --engage --dataset zbl_data_v2 --gripper-max 1.70 \
+python3 master_bridge.py --engage --dataset zbl_data_v4 --gripper-max 1.70 \
   --task "pick up test tube No. 1 from the left rack and place it in the right rack"
 # 遥操中每集三键流程: sw1=开录 -> sw3=结束本集(挂起待存) -> sw4=确认写入
 #   - 不按sw4直接再按sw1 = 丢弃上一集, 直接重录
 #   - Ctrl+C退出时: 录制中的集同步写完, 挂起未确认的集自动保存
 #   - sw4写入在后台进行(视频编码需数秒), 不影响继续遥操
 # 数据直接落在仓库 data/ 目录(仓库整体挂载, 宿主机即时可见, 不需拷贝):
-#   ~/workspace/zbl_arm_6a_datacol/data/zbl_data_v2/<任务名>/
+#   ~/workspace/zbl_arm_6a_datacol/data/zbl_data_v4/<任务名>/
 #   每个任务名目录是一个独立完整的LeRobot数据集(同任务自动增量追加)
 #   训练时 repo_id 指到任务目录 -> wall-x compute_norm_stats.py -> 训练
 ```
@@ -230,7 +231,7 @@ python3 master_bridge.py --engage --dataset zbl_data_v2 --gripper-max 1.70 \
 ```bash
 python3 replay.py --list                       # 列出仓库内全部数据集
 python3 replay.py data/zbl_data/<任务目录>      # 干跑: 打印episode摘要
-python3 replay.py data/zbl_data_v2/<任务目录> --engage         # 新数据从meta读取夹爪比例
+python3 replay.py data/zbl_data_v4/<任务目录> --engage         # 新数据从meta读取夹爪比例
 python3 replay.py data/zbl_data/<任务目录> --episode 0 --speed 0.5 --grip-max <当时实际采集上限rad> --engage
 # 回放的是observation.joints=录制时从臂真实轨迹; 开始/结束自动限速缓动回零
 # (--no-home-start/--no-home-end跳过), 自带预对齐/限幅/软急停
@@ -248,9 +249,10 @@ python3 replay.py data/zbl_data/<任务目录> --episode 0 --speed 0.5 --grip-ma
 
 ### 7.1 新采集记录与旧数据兼容
 
-新版增加 `acq.*` 诊断列，模型使用的 `observation.state/action` 仍为原来的
-10 维，`observation.joints` 仍为 7 维。**已有旧 schema 的数据集会在开录前拒绝
-追加**，请使用新分组名（例如 `--dataset zbl_data_v2`）；程序不会回填或改写旧
+此次采集 schema 升至 3：包含 `command.*`、原始夹爪反馈、主臂EE和对应诊断列，模型使用的
+`observation.state/action` 仍为原来的 10 维，`observation.joints` 仍为 7 维。
+**已有旧 schema（包括只含原 `acq.*` 的上一版）会在开录前拒绝追加**，请使用
+全新分组名（例如 `--dataset zbl_data_v4`）；程序不会回填或改写旧
 50 条轨迹、旧 `norm_stats.json` 和 checkpoint。
 
 夹爪数据是实测 `arm_gripper / --gripper-max` 后的 `[0,1]` 比例。命令中的
@@ -267,14 +269,15 @@ episode，额外的 `acq.*` 列不会改变回放轨迹。
 
 ```text
 <task>/
-├── data/                         # state/action/joints及acq.*数值列
+├── data/                         # state/action、反馈、对齐命令及acq.*数值列
 ├── videos/                       # 编码后的相机视频
 ├── meta/
 │   ├── info.json、stats.json     # 由LeRobot管理
 │   ├── episodes/、tasks.parquet  # 由LeRobot管理
 │   └── acquisition/              # 本项目扩展，不是LeRobot标准必填字段
 │       ├── dataset_contract.json
-│       └── episode_000000.json
+│       ├── episode_000000.json
+│       └── episode_000000.streams.jsonl  # 全频率命令/关节反馈/主臂EE
 └── images/                       # 仅编码临时PNG，成功后删除空父目录
 ```
 
@@ -293,6 +296,90 @@ episode，额外的 `acq.*` 列不会改变回放轨迹。
 episode JSON 保存实际 CLI、源码 SHA/dirty 状态及源码文件 hash、topic/frame_id、
 单位、夹爪上限、时钟域、质量摘要和 `--calibration-id`。标定 ID 仅引用外部核验记录；
 采集程序不自动验证物理坐标轴/工具零姿态，也不应用额外坐标变换。
+
+### 7.1.1 同时保存下发命令和从臂反馈
+
+确认保存（sw4或退出时自动保存）后，每个训练帧的 `data/` Parquet 包含：
+
+| 字段 | 形状、单位 | 含义 |
+|---|---|---|
+| `observation.joints` | 7；前6维rad，末维[0,1] | 从臂实测关节角及归一化夹爪反馈 |
+| `observation.gripper_position` | 1；rad，float64 | 未归一化、未裁剪的夹爪反馈，便于直接比较跟踪误差 |
+| `observation.state` | 10；xyz米+rotation6D+夹爪比例 | 当前实测末端状态，模型输入定义不变 |
+| `observation.master_ee_pose` | 7；xyz米+四元数xyzw，float64 | 主臂发布的EE位姿，保留它的原坐标系；不拼进模型state |
+| `command.joints` | 6；rad，float64 | 最近一次成功调用publish的从臂关节目标，已经过控制循环的限位/限速处理 |
+| `command.gripper` | 1；rad，float64 | 最近一次成功调用publish的夹爪目标，已经过限速/裁剪处理 |
+| `action` | ee模式10；joints模式7 | 下一采样时刻的实测状态，仍不是原始下发命令 |
+
+关节顺序始终为 `arm_joint1` 到 `arm_joint6`；夹爪为 `arm_gripper`。
+命令使用**从臂关节反馈接收时刻之前最后一次发布值**进行因果保持，不取未来最近邻。
+即使 `--sync-clock header`，该关联仍用本机 monotonic 时间；它不能证明曝光同步、
+控制器收到指令或指令已经执行。每帧各有以下两个诊断字段组：
+
+```text
+acq.command_joints.{publish_mono_ns,reference_mono_ns,source_index,age_ns,valid}
+acq.command_gripper.{publish_mono_ns,reference_mono_ns,source_index,age_ns,valid}
+```
+
+`reference_mono_ns` 是所选关节反馈的接收时间；`age_ns` 是该时刻减去发送时间。
+夹爪不变时不会每帧重发，旧目标继续作为最后发布值保留，原发送时间不会改写。
+开录时携带已知的最后发布目标，标记为 `carried_from_before_recording=true`；
+不会把仅缓存的反馈伪装成命令。尚无对应发布值时，`valid=0`、`source_index=-1`、
+`publish_mono_ns=0`、`age_ns=-1`，数值列的零仅为占位，不能用于跟踪误差分析。
+`acq.valid` 仍表示观测流对齐质量，命令是否存在须查看各自的 `valid`。
+
+为保留20Hz重采样丢弃的数值消息，另写
+`meta/acquisition/episode_000000.streams.jsonl`。这是本项目的原始采集证据扩展，
+不在 `data/` 下放入另一套不同频率的 Parquet，避免训练reader误扫为训练帧。
+该JSONL保存掐头去尾前的以下四种数值流；各流内按时间和 `sample_index` 排序：
+
+| `stream` | `values` | 时间及额外字段 |
+|---|---|---|
+| `command.joints` | 原始发布的6个关节目标，rad | `publish_mono_ns`、`sample_index`、`carried_from_before_recording` |
+| `command.gripper` | 原始发布的1个夹爪目标，rad | 同上 |
+| `feedback.joints` | 6个关节反馈+1个原始夹爪反馈，全部rad | `receive_mono_ns`、原始`header_time_ns`、`frame_id`、`sample_index` |
+| `feedback.master_ee_pose` | 主臂xyz米+四元数xyzw，7维 | `receive_mono_ns`、原始`header_time_ns`、`frame_id`、`sample_index`、`carried_from_before_recording` |
+
+这份文件在episode确认保存时写入，不是实时掉电保护日志。记录进程崩溃前尚未保存的
+内存数据仍可能丢失。episode JSON的 `raw_streams` 保存相对路径、各流样本数和SHA256；
+编码失败时保留原始流和 `.pending.json`，不会标成完整episode。
+`command.*` 和 `acq.*` 不加入训练输入，也不生成归一化统计；后续若要用实际命令
+训练关节策略，应显式选择这些字段及时间关系。
+
+### 7.1.2 主臂EE位姿的接入与字段
+
+`master_rx.py` 从主臂PC的rosbridge接收EE消息，经本机UDP转发到录制进程。
+当前明确支持 `geometry_msgs/PoseStamped`（ROS1/ROS2时间戳字段均支持），保存原始
+`[x,y,z,qx,qy,qz,qw]`。不会猜测无类型数组中的Euler顺序/单位，也不会用从臂FK冒充主臂EE。
+
+默认 `--master-ee-topic auto` 通过只读 `/rosapi/topics` 查询，只在唯一候选同时满足
+PoseStamped类型、名称包含master/leader及所选left/right，并排除target/goal/command等
+明显的指令话题时自动订阅。话题的实际物理含义仍需核验。不能唯一判断，
+或主臂没有rosapi服务时，请用 `--master-ee-topic` 填入实际确认的话题名；明确指定话题
+不依赖rosapi，但收到的消息结构仍需通过PoseStamped校验。
+当前开发环境尚未连通主臂PC，实际话题名和实机发布需现场核验。
+
+未收到新鲜EE时拒绝开录，已有待保存数据不会因此丢弃；这不阻止原来的关节遥操。
+若录制中部分EE样本陈旧，会保留最后一次实测值并标 `valid=0`；没有任何新鲜匹配
+时拒绝整条episode保存。缺少先前样本时数值零只是占位，不代表有效姿态。
+字段如下：
+
+```text
+observation.master_ee_pose                           # float64[7]
+acq.master_pose.header_time_ns                        # 原主臂ROS stamp，未知为0
+acq.master_pose.receive_mono_ns                       # 主臂接收进程收到该消息的本机时刻
+acq.master_pose.reference_mono_ns                     # 对齐所用从臂关节反馈接收时刻
+acq.master_pose.source_index                         # 原始主臂EE流索引
+acq.master_pose.age_ns                               # reference - receive
+acq.master_pose.valid                                # 是否有此前样本且年龄在阈值内
+```
+
+主臂EE使用同一采集机的monotonic接收时钟进行因果保持，不用主臂ROS stamp与从臂
+stamp直接相减；阈值复用 `--sync-max-age-ms`。`frame_id`、topic、消息类型和左右侧
+写入episode JSON的 `master_pose_source`，原始流每条也保留frame_id。主臂与从臂
+即使出现同名frame_id，也不代表物理坐标系相同；本程序不做主从外参变换。
+更换主臂来源或frame定义需要新数据集，episode内来源变化会拒绝保存。
+该字段为辅助记录，排除归一化统计，不改变现有从臂 `observation.state/action`。
 
 ### 7.2 同步检查
 
@@ -330,7 +417,7 @@ episode JSON 保存实际 CLI、源码 SHA/dirty 状态及源码文件 hash、to
 
 本项目的 `lerobot_stats.py` 适配器固定针对 **LeRobot 0.4.4**：只在受锁保护的
 单次保存期间替换统计回调，在 `finally` 恢复，不修改 site-packages 文件。
-图像先转 `float64` 再计算平方和，避免 `uint8` 溢出造成 std=0；跳过 `acq.*`
+图像先转 `float64` 再计算平方和，避免 `uint8` 溢出造成 std=0；跳过 `acq.*` 和 `command.*`
 诊断统计，避免绝对纳秒整数溢出和误入归一化。其他版本先验证 API 再使用，开录
 前会检查版本。不要在同一进程中并发运行其他未经过该锁的 LeRobot writer。
 
@@ -348,5 +435,5 @@ observation.joints(7=6关节+夹爪归一化, 备用), action(10=从臂末端绝
 与state同一条从臂流错开一帧, action[i]≡state[i+1], 官方x2robot2lerobot同语义;
 训练侧loader自动转delta; joints模式为7), observation.images.wrist(相机视频),
 任务标签来自--task自然语言指令。
-训练侧: 把 `data/zbl_data_v2/<任务名>/` 整个目录拷到训练机，先固定完整episode
+训练侧: 把 `data/zbl_data_v4/<任务名>/` 整个目录拷到训练机，先固定完整episode
 划分，再只用训练episodes及episode内合法动作窗口计算归一化统计。
