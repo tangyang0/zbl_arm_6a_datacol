@@ -153,6 +153,14 @@ python3 master_bridge.py --engage
 | 扳机 | trigger | 夹爪比例开合(0~1) |
 | 摇杆 | joystick_x/y | 空闲(单臂不用; 厂家整机用于底盘/头部) |
 
+**主从臂独立回零工具**(不需要master_bridge在跑, 容器内执行):
+```bash
+python3 home.py                # 主从臂同步限速回零(默认0.3rad/s)
+python3 home.py --vmax 0.15    # 更慢
+python3 home.py --no-master    # 只回从臂 / --no-slave 只回主臂
+# 主臂回零后自动恢复重力补偿; 从臂含夹爪控制器重置, 结束软急停
+```
+
 急停(容器内随时执行, 从臂停止接受指令):
 ```bash
 ros2 control switch_controllers --deactivate joint_position_controller cart_pose_controller zero_force_dragging_controller
